@@ -4,29 +4,58 @@
 #include <sstream>
 #include <cstdlib>
 #include <algorithm>
-#include <chrono>
-#include <thread>
+#include <cstring>
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cross-platform popen/pclose
+// ─────────────────────────────────────────────────────────────────────────────
 std::string CodeExecutor::runCommand(const std::string& cmd) {
     std::string output;
+#ifdef _WIN32
     FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) return "[ERROR] Failed to run command: " + cmd;
+#else
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) return "[ERROR] Failed to run: " + cmd;
     char buf[512];
     while (fgets(buf, sizeof(buf), pipe))
         output += buf;
+#ifdef _WIN32
     _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
     return output;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+static std::string tempDir() {
+#ifdef _WIN32
+    const char* t = std::getenv("TEMP");
+    if (!t) t = std::getenv("TMP");
+    return t ? std::string(t) : "C:\\Temp";
+#else
+    return "/tmp";
+#endif
+}
+
+static std::string pathSep() {
+#ifdef _WIN32
+    return "\\";
+#else
+    return "/";
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 std::string CodeExecutor::writeTempFile(const std::string& code, const std::string& ext) {
-    std::string tmp = std::getenv("TEMP") ? std::string(std::getenv("TEMP")) : ".";
-    std::string path = tmp + "\\ww_code" + ext;
+    std::string path = tempDir() + pathSep() + "ww_code" + ext;
     std::ofstream f(path);
     f << code;
     return path;
@@ -76,41 +105,67 @@ Language CodeExecutor::detectLanguage(const std::string& code, const std::string
     std::string h = hint;
     std::transform(h.begin(), h.end(), h.begin(), ::tolower);
 
-    if (h == "python" || h == "py")        return Language::PYTHON;
-    if (h == "c++" || h == "cpp")          return Language::CPP;
-    if (h == "c")                           return Language::C;
-    if (h == "javascript" || h == "js")    return Language::JAVASCRIPT;
-    if (h == "java")                        return Language::JAVA;
-    if (h == "rust" || h == "rs")          return Language::RUST;
-    if (h == "go" || h == "golang")        return Language::GO;
-    if (h == "typescript" || h == "ts")    return Language::TYPESCRIPT;
-    if (h == "bash" || h == "sh")          return Language::BASH;
-    if (h == "c#" || h == "csharp")        return Language::CSHARP;
+    if (h == "python" || h == "py")         return Language::PYTHON;
+    if (h == "c++" || h == "cpp")           return Language::CPP;
+    if (h == "c")                            return Language::C;
+    if (h == "javascript" || h == "js")     return Language::JAVASCRIPT;
+    if (h == "java")                         return Language::JAVA;
+    if (h == "rust" || h == "rs")           return Language::RUST;
+    if (h == "go" || h == "golang")         return Language::GO;
+    if (h == "typescript" || h == "ts")     return Language::TYPESCRIPT;
+    if (h == "bash" || h == "sh")           return Language::BASH;
+    if (h == "c#" || h == "csharp")         return Language::CSHARP;
+    if (h == "kotlin" || h == "kt")         return Language::KOTLIN;
 
-    // Auto-detect from code content
+    // Heuristic auto-detect from code content
     if (code.find("#include") != std::string::npos) {
         if (code.find("std::") != std::string::npos ||
             code.find("cout")  != std::string::npos ||
-            code.find("cin")   != std::string::npos)
+            code.find("cin")   != std::string::npos ||
+            code.find("vector") != std::string::npos)
             return Language::CPP;
         return Language::C;
     }
     if (code.find("def ") != std::string::npos ||
         code.find("import ") != std::string::npos ||
-        code.find("print(") != std::string::npos)    return Language::PYTHON;
+        code.find("print(") != std::string::npos)     return Language::PYTHON;
     if (code.find("public class") != std::string::npos) return Language::JAVA;
     if (code.find("fn main()") != std::string::npos)    return Language::RUST;
     if (code.find("func main()") != std::string::npos)  return Language::GO;
-    if (code.find("console.log") != std::string::npos)  return Language::JAVASCRIPT;
+    if (code.find("console.log") != std::string::npos ||
+        code.find("const ") != std::string::npos ||
+        code.find("let ") != std::string::npos)         return Language::JAVASCRIPT;
     if (code.find("using System") != std::string::npos) return Language::CSHARP;
+    if (code.find("fun main") != std::string::npos)     return Language::KOTLIN;
 
-    return Language::PYTHON; // default fallback
+    return Language::PYTHON; // safe default
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 ExecutionResult CodeExecutor::execute(const std::string& code, const std::string& langHint) {
-    Language lang = detectLanguage(code, langHint);
-    return execute(code, lang);
+    return execute(code, detectLanguage(code, langHint));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: does the output string look like an error?
+// ─────────────────────────────────────────────────────────────────────────────
+static bool looksLikeError(const std::string& out) {
+    // Common error indicators across all languages
+    const char* markers[] = {
+        "error:", "Error:", "ERROR:",
+        "exception", "Exception",
+        "Traceback", "SyntaxError", "TypeError", "ValueError",
+        "NameError", "AttributeError", "ImportError",
+        "undefined reference", "linker error",
+        "cannot find symbol", "ClassNotFoundException",
+        "panic:", "FAILED", "fatal error",
+        nullptr
+    };
+    for (int i = 0; markers[i]; i++) {
+        if (out.find(markers[i]) != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,30 +173,33 @@ ExecutionResult CodeExecutor::execute(const std::string& code, Language lang) {
     ExecutionResult result;
     result.language = languageName(lang);
 
-    std::string tmp = std::getenv("TEMP") ? std::string(std::getenv("TEMP")) : ".";
-    std::string ext = languageExtension(lang);
-    std::string srcFile = writeTempFile(code, ext);
-    std::string outExe  = tmp + "\\ww_out.exe";
+    std::string tmp    = tempDir();
+    std::string sep    = pathSep();
+    std::string ext    = languageExtension(lang);
+    std::string src    = writeTempFile(code, ext);
+#ifdef _WIN32
+    std::string outExe = tmp + sep + "ww_out.exe";
+#else
+    std::string outExe = tmp + sep + "ww_out";
+#endif
 
     std::string runCmd;
 
     switch (lang) {
         // ── Python ───────────────────────────────────────────────────────────
-        case Language::PYTHON: {
-            runCmd = "python \"" + srcFile + "\" 2>&1";
+        case Language::PYTHON:
+            runCmd = "python3 \"" + src + "\" 2>&1";
+#ifdef _WIN32
+            runCmd = "python \"" + src + "\" 2>&1"; // Windows uses 'python'
+#endif
             break;
-        }
 
         // ── C++ ──────────────────────────────────────────────────────────────
         case Language::CPP: {
-            std::string compileOut = runCommand(
-                "g++ -o \"" + outExe + "\" \"" + srcFile + "\" 2>&1"
-            );
-            if (!compileOut.empty() && compileOut.find("error") != std::string::npos) {
-                result.errorOutput = compileOut;
-                result.exitCode = 1;
-                deleteTempFile(srcFile);
-                return result;
+            std::string co = runCommand("g++ -std=c++17 -o \"" + outExe + "\" \"" + src + "\" 2>&1");
+            if (looksLikeError(co)) {
+                result.errorOutput = co; result.exitCode = 1;
+                deleteTempFile(src); return result;
             }
             runCmd = "\"" + outExe + "\" 2>&1";
             break;
@@ -149,41 +207,33 @@ ExecutionResult CodeExecutor::execute(const std::string& code, Language lang) {
 
         // ── C ────────────────────────────────────────────────────────────────
         case Language::C: {
-            std::string compileOut = runCommand(
-                "gcc -o \"" + outExe + "\" \"" + srcFile + "\" 2>&1"
-            );
-            if (!compileOut.empty() && compileOut.find("error") != std::string::npos) {
-                result.errorOutput = compileOut;
-                result.exitCode = 1;
-                deleteTempFile(srcFile);
-                return result;
+            std::string co = runCommand("gcc -o \"" + outExe + "\" \"" + src + "\" 2>&1");
+            if (looksLikeError(co)) {
+                result.errorOutput = co; result.exitCode = 1;
+                deleteTempFile(src); return result;
             }
             runCmd = "\"" + outExe + "\" 2>&1";
             break;
         }
 
-        // ── JavaScript (Node.js) ─────────────────────────────────────────────
-        case Language::JAVASCRIPT: {
-            runCmd = "node \"" + srcFile + "\" 2>&1";
+        // ── JavaScript ───────────────────────────────────────────────────────
+        case Language::JAVASCRIPT:
+            runCmd = "node \"" + src + "\" 2>&1";
             break;
-        }
 
         // ── TypeScript ───────────────────────────────────────────────────────
-        case Language::TYPESCRIPT: {
-            runCmd = "ts-node \"" + srcFile + "\" 2>&1";
+        case Language::TYPESCRIPT:
+            runCmd = "ts-node \"" + src + "\" 2>&1";
             break;
-        }
 
         // ── Java ─────────────────────────────────────────────────────────────
         case Language::JAVA: {
-            std::string compileOut = runCommand("javac \"" + srcFile + "\" 2>&1");
-            if (!compileOut.empty()) {
-                result.errorOutput = compileOut;
-                result.exitCode = 1;
-                deleteTempFile(srcFile);
-                return result;
+            std::string co = runCommand("javac \"" + src + "\" 2>&1");
+            if (looksLikeError(co)) {
+                result.errorOutput = co; result.exitCode = 1;
+                deleteTempFile(src); return result;
             }
-            // Extract class name from code
+            // Extract class name
             std::string className = "Main";
             auto pos = code.find("public class ");
             if (pos != std::string::npos) {
@@ -198,64 +248,68 @@ ExecutionResult CodeExecutor::execute(const std::string& code, Language lang) {
 
         // ── Rust ─────────────────────────────────────────────────────────────
         case Language::RUST: {
-            std::string compileOut = runCommand(
-                "rustc -o \"" + outExe + "\" \"" + srcFile + "\" 2>&1"
-            );
-            if (!compileOut.empty() && compileOut.find("error") != std::string::npos) {
-                result.errorOutput = compileOut;
-                result.exitCode = 1;
-                deleteTempFile(srcFile);
-                return result;
+            std::string co = runCommand("rustc -o \"" + outExe + "\" \"" + src + "\" 2>&1");
+            if (looksLikeError(co)) {
+                result.errorOutput = co; result.exitCode = 1;
+                deleteTempFile(src); return result;
             }
             runCmd = "\"" + outExe + "\" 2>&1";
             break;
         }
 
         // ── Go ───────────────────────────────────────────────────────────────
-        case Language::GO: {
-            runCmd = "go run \"" + srcFile + "\" 2>&1";
+        case Language::GO:
+            runCmd = "go run \"" + src + "\" 2>&1";
             break;
-        }
 
         // ── C# ───────────────────────────────────────────────────────────────
         case Language::CSHARP: {
-            std::string compileOut = runCommand(
-                "csc -out:\"" + outExe + "\" \"" + srcFile + "\" 2>&1"
-            );
-            if (!compileOut.empty() && compileOut.find("error") != std::string::npos) {
-                result.errorOutput = compileOut;
-                result.exitCode = 1;
-                deleteTempFile(srcFile);
-                return result;
+#ifdef _WIN32
+            std::string co = runCommand("csc -out:\"" + outExe + "\" \"" + src + "\" 2>&1");
+#else
+            std::string co = runCommand("mcs -out:\"" + outExe + "\" \"" + src + "\" 2>&1");
+#endif
+            if (looksLikeError(co)) {
+                result.errorOutput = co; result.exitCode = 1;
+                deleteTempFile(src); return result;
             }
+#ifdef _WIN32
             runCmd = "\"" + outExe + "\" 2>&1";
+#else
+            runCmd = "mono \"" + outExe + "\" 2>&1";
+#endif
+            break;
+        }
+
+        // ── Kotlin ───────────────────────────────────────────────────────────
+        case Language::KOTLIN: {
+            std::string jarOut = tmp + sep + "ww_out.jar";
+            std::string co = runCommand("kotlinc \"" + src + "\" -include-runtime -d \"" + jarOut + "\" 2>&1");
+            if (looksLikeError(co)) {
+                result.errorOutput = co; result.exitCode = 1;
+                deleteTempFile(src); return result;
+            }
+            runCmd = "java -jar \"" + jarOut + "\" 2>&1";
             break;
         }
 
         // ── Bash ─────────────────────────────────────────────────────────────
-        case Language::BASH: {
-            runCmd = "bash \"" + srcFile + "\" 2>&1";
+        case Language::BASH:
+            runCmd = "bash \"" + src + "\" 2>&1";
             break;
-        }
 
-        default: {
+        default:
             result.errorOutput = "[whyWhale] Unsupported language.";
             result.exitCode = 1;
-            deleteTempFile(srcFile);
+            deleteTempFile(src);
             return result;
-        }
     }
 
-    // Run the command
+    // Execute
     result.output = runCommand(runCmd);
     result.exitCode = 0;
-    result.success  = result.errorOutput.empty();
 
-    // Check if output contains error indicators
-    if (result.output.find("Error") != std::string::npos ||
-        result.output.find("error") != std::string::npos ||
-        result.output.find("Exception") != std::string::npos ||
-        result.output.find("Traceback") != std::string::npos) {
+    if (looksLikeError(result.output)) {
         result.errorOutput = result.output;
         result.success = false;
         result.exitCode = 1;
@@ -263,9 +317,7 @@ ExecutionResult CodeExecutor::execute(const std::string& code, Language lang) {
         result.success = true;
     }
 
-    // Cleanup
-    deleteTempFile(srcFile);
+    deleteTempFile(src);
     std::remove(outExe.c_str());
-
     return result;
 }
