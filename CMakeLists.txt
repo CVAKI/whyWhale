@@ -4,49 +4,46 @@ project(whyWhale CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── Auto-download nlohmann/json (header-only, no manual install needed) ──────
+# ── Auto-download nlohmann/json into a proper nlohmann/ subfolder ─────────────
 include(FetchContent)
 FetchContent_Declare(
         nlohmann_json
         URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
         DOWNLOAD_NO_EXTRACT TRUE
-        SOURCE_DIR ${CMAKE_BINARY_DIR}/nlohmann
+        SOURCE_DIR ${CMAKE_BINARY_DIR}/nlohmann_include/nlohmann
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 add_executable(whyWhale
         main.cpp
-        ai_engine.cpp
-        code_executor.cpp
-        error_fixer.cpp
-        editor_ui.cpp
-        ollama_manager.cpp
+        src/ai_engine.cpp
+        src/code_executor.cpp
+        src/error_fixer.cpp
+        src/editor_ui.cpp
+        src/ollama_manager.cpp
 )
 
 # ── Include paths ─────────────────────────────────────────────────────────────
 target_include_directories(whyWhale PRIVATE
         ${CMAKE_SOURCE_DIR}
-        ${CMAKE_BINARY_DIR}/nlohmann
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}/nlohmann_include
 )
 
 # ── Windows-specific settings ─────────────────────────────────────────────────
 if(WIN32)
-    # Link Winsock (needed by ollama_manager for TCP socket check)
-    target_link_libraries(whyWhale PRIVATE ws2_32)
+    # ws2_32  = Winsock (TCP socket check)
+    # shell32 = ShellExecuteEx (silent installer launch)
+    target_link_libraries(whyWhale PRIVATE ws2_32 shell32)
 
-    # Use /utf-8 so MSVC handles Unicode string literals correctly
     if(MSVC)
         target_compile_options(whyWhale PRIVATE /utf-8 /W3)
     else()
-        # MinGW / GCC on Windows
         target_compile_options(whyWhale PRIVATE -municode -Wall -Wextra)
     endif()
 
-    # Set subsystem to CONSOLE (keeps the terminal window)
-    set_target_properties(whyWhale PROPERTIES
-            WIN32_EXECUTABLE FALSE
-    )
+    set_target_properties(whyWhale PROPERTIES WIN32_EXECUTABLE FALSE)
 endif()
 
 # ── Release build optimisations ───────────────────────────────────────────────
