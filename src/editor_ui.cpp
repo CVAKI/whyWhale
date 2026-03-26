@@ -8,18 +8,20 @@
 
 #ifdef _WIN32
 #include <windows.h>
-// Enable ANSI escape codes on Windows 10+
 static void enableANSI() {
+    // Fix garbled box-drawing/emoji: switch console to UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    // Enable ANSI/VT escape codes (Windows 10+)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
-    GetConsoleMode(h, &mode);
-    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    if (GetConsoleMode(h, &mode))
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 #else
 static void enableANSI() {}
 #endif
 
-// ── ANSI Colors ───────────────────────────────────────────────────────────────
 #define RESET   "\033[0m"
 #define BOLD    "\033[1m"
 #define CYAN    "\033[36m"
@@ -32,7 +34,9 @@ static void enableANSI() {}
 #define DIM     "\033[2m"
 
 // ─────────────────────────────────────────────────────────────────────────────
-void EditorUI::separator(char c, int width) {
+// separator now takes std::string so Unicode box-drawing characters work fine
+// ─────────────────────────────────────────────────────────────────────────────
+void EditorUI::separator(const std::string& c, int width) {
     std::cout << CYAN;
     for (int i = 0; i < width; i++) std::cout << c;
     std::cout << RESET << "\n";
@@ -57,14 +61,14 @@ void EditorUI::showBanner() {
     std::cout << DIM
               << "              Powered by Ollama · Runs Locally · Any Language\n\n"
               << RESET;
-    separator('═', 72);
+    separator("═", 72);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::printCode(const std::string& code, const std::string& lang) {
-    separator('-', 60);
+    separator("-", 60);
     std::cout << BOLD << YELLOW << "  📄 Generated " << lang << " Code:\n" << RESET;
-    separator('-', 60);
+    separator("-", 60);
     std::cout << GREEN;
 
     std::istringstream ss(code);
@@ -76,12 +80,12 @@ void EditorUI::printCode(const std::string& code, const std::string& lang) {
     }
 
     std::cout << RESET;
-    separator('-', 60);
+    separator("-", 60);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::printResult(const ExecutionResult& result) {
-    separator('-', 60);
+    separator("-", 60);
     if (result.success) {
         std::cout << BOLD << GREEN << "  ✅ Execution Successful!\n" << RESET;
         std::cout << "  Output:\n" << YELLOW;
@@ -90,7 +94,7 @@ void EditorUI::printResult(const ExecutionResult& result) {
         std::cout << BOLD << RED << "  ❌ Execution Error:\n" << RESET;
         std::cout << RED << result.errorOutput << RESET << "\n";
     }
-    separator('-', 60);
+    separator("-", 60);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,22 +142,19 @@ std::string EditorUI::readMultilineInput(const std::string& promptMsg) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::handleNewTask(AIEngine& ai, CodeExecutor& executor, ErrorFixer& fixer) {
-    separator('═', 72);
+    separator("═", 72);
     std::cout << BOLD << WHITE << "  🤖 NEW CODING TASK\n" << RESET;
 
-    // Get task description
     std::cout << BOLD << CYAN << "\n  📝 Describe what you want to build:\n" << RESET;
     std::cout << DIM << "  (Be specific! e.g. 'Create a calculator that adds, subtracts, multiplies, divides')\n" << RESET;
     std::cout << "  > ";
     std::string task;
     std::getline(std::cin, task);
 
-    // Select language
     std::string language = selectLanguage();
 
     std::cout << BOLD << CYAN << "\n  [🤖 whyWhale is generating your " << language << " code...]\n" << RESET;
 
-    // Generate code
     std::string code = ai.generateCode(task, language);
 
     if (code.empty()) {
@@ -163,7 +164,6 @@ void EditorUI::handleNewTask(AIEngine& ai, CodeExecutor& executor, ErrorFixer& f
 
     printCode(code, language);
 
-    // Auto-fix loop
     std::cout << BOLD << CYAN << "\n  [🔁 Running self-healing fix loop...]\n" << RESET;
     FixResult fixResult = fixer.fixUntilClean(code, language, 10);
 
@@ -185,9 +185,8 @@ void EditorUI::handleNewTask(AIEngine& ai, CodeExecutor& executor, ErrorFixer& f
         printCode(fixResult.finalCode, language);
     }
 
-    // Ask user if satisfied
     while (true) {
-        separator('-', 60);
+        separator("-", 60);
         std::cout << BOLD << "\n  Are you satisfied with this result?\n" << RESET;
         std::cout << "  [1] ✅ Yes, I'm done\n";
         std::cout << "  [2] 🔄 Modify the task and regenerate\n";
@@ -201,7 +200,6 @@ void EditorUI::handleNewTask(AIEngine& ai, CodeExecutor& executor, ErrorFixer& f
         if (choice == 1) {
             break;
         } else if (choice == 2) {
-            // Let user modify task
             std::cout << CYAN << "  Enter modified task: " << RESET;
             std::getline(std::cin, task);
             code = ai.generateCode(task, language);
@@ -231,7 +229,7 @@ void EditorUI::handleNewTask(AIEngine& ai, CodeExecutor& executor, ErrorFixer& f
 
 // ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::handleFixCode(AIEngine& ai, CodeExecutor& executor, ErrorFixer& fixer) {
-    separator('═', 72);
+    separator("═", 72);
     std::cout << BOLD << WHITE << "  🛠 FIX MY CODE\n" << RESET;
 
     std::string language = selectLanguage();
@@ -252,7 +250,7 @@ void EditorUI::handleFixCode(AIEngine& ai, CodeExecutor& executor, ErrorFixer& f
 
 // ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::handleSettings(AIEngine& ai, OllamaManager& ollama) {
-    separator('═', 72);
+    separator("═", 72);
     std::cout << BOLD << WHITE << "  ⚙ SETTINGS\n" << RESET;
     std::cout << "  Current Model: " << YELLOW << ai.getModel() << RESET << "\n\n";
     std::cout << "  [1] Change AI model\n";
@@ -285,7 +283,7 @@ void EditorUI::handleSettings(AIEngine& ai, OllamaManager& ollama) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::showHelp() {
-    separator('═', 72);
+    separator("═", 72);
     std::cout << BOLD << WHITE << "  📚 whyWhale Help\n\n" << RESET;
     std::cout << "  whyWhale is an AI-powered code editor that:\n\n";
     std::cout << "  🤖 Generates complete, working code from your description\n";
@@ -302,8 +300,6 @@ void EditorUI::showHelp() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN RUN LOOP
-// ─────────────────────────────────────────────────────────────────────────────
 void EditorUI::run(const std::string& model) {
     OllamaManager ollama;
     AIEngine      ai(model);
@@ -315,7 +311,7 @@ void EditorUI::run(const std::string& model) {
               << RESET;
 
     while (true) {
-        separator('═', 72);
+        separator("═", 72);
         std::cout << BOLD << WHITE << "\n  🐋 whyWhale — Main Menu\n\n" << RESET;
         std::cout << "  [1]  🤖  New Coding Task     — Describe what to build\n";
         std::cout << "  [2]  🛠   Fix My Code         — Paste broken code to auto-fix\n";
@@ -333,10 +329,10 @@ void EditorUI::run(const std::string& model) {
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
         switch (choice) {
-            case 1: handleNewTask(ai, executor, fixer);     break;
-            case 2: handleFixCode(ai, executor, fixer);     break;
-            case 3: handleSettings(ai, ollama);              break;
-            case 4: showHelp();                              break;
+            case 1: handleNewTask(ai, executor, fixer);  break;
+            case 2: handleFixCode(ai, executor, fixer);  break;
+            case 3: handleSettings(ai, ollama);           break;
+            case 4: showHelp();                           break;
             case 5:
                 std::cout << CYAN << "\n  🐋 Goodbye from whyWhale!\n\n" << RESET;
                 return;

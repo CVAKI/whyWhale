@@ -1,14 +1,15 @@
 #include "ollama_manager.h"
 #include <iostream>
 #include <string>
+#include <vector>
 #include <cstdlib>
 #include <fstream>
 #include <thread>
 #include <chrono>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
@@ -37,7 +38,6 @@ bool OllamaManager::isInstalled() {
 bool OllamaManager::install() {
     std::cout << "\n[whyWhale] Downloading Ollama installer for Windows...\n";
 
-    // Use curl.exe (built into Windows 10/11) to download the installer
     std::string downloadCmd =
         "curl -L -o \"%TEMP%\\ollama-setup.exe\" "
         "https://ollama.ai/download/OllamaSetup.exe";
@@ -52,16 +52,14 @@ bool OllamaManager::install() {
     ret = std::system("\"%TEMP%\\ollama-setup.exe\" /SILENT /NORESTART");
 
     if (ret != 0) {
-        // Try non-silent in case silent flag isn't supported
         std::system("\"%TEMP%\\ollama-setup.exe\"");
     }
 
-    // Wait for install to complete
     std::cout << "[whyWhale] Waiting for installation to complete...\n";
     for (int i = 0; i < 15; i++) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         if (isInstalled()) {
-            std::cout << "[whyWhale] ✓ Ollama installed successfully!\n";
+            std::cout << "[whyWhale] \u2713 Ollama installed successfully!\n";
             return true;
         }
         std::cout << "  ... checking (" << (i+1) << "/15)\n";
@@ -96,23 +94,11 @@ bool OllamaManager::isServerRunning() {
 // ─────────────────────────────────────────────────────────────────────────────
 void OllamaManager::startServer() {
 #ifdef _WIN32
-    // Launch ollama serve in a detached process (no console window)
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi;
-
-    std::string cmd = "ollama serve";
-    std::vector<char> cmdBuf(cmd.begin(), cmd.end());
-    cmdBuf.push_back('\0');
-
-    CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr,
-                   FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    // "start /B" resolves ollama via PATH (same as typing it in cmd).
+    // Redirecting to NUL keeps the background process silent.
+    std::system("start /B "" ollama serve > NUL 2>&1");
 #else
-    std::system("ollama serve &");
+    std::system("ollama serve > /dev/null 2>&1 &");
 #endif
 
     std::cout << "[whyWhale] Starting Ollama server";
@@ -134,15 +120,15 @@ bool OllamaManager::isModelPulled(const std::string& model) {
 bool OllamaManager::pullModel(const std::string& model) {
     std::cout << "[whyWhale] Pulling model: " << model << "\n";
     std::cout << "[whyWhale] This may take several minutes depending on your internet speed...\n";
-    std::cout << "[whyWhale] Model size ~4-5 GB — please wait...\n\n";
+    std::cout << "[whyWhale] Model size ~4-5 GB \u2014 please wait...\n\n";
 
     int ret = std::system(("ollama pull " + model).c_str());
 
     if (ret == 0 || isModelPulled(model)) {
-        std::cout << "\n[whyWhale] ✓ Model " << model << " is ready!\n";
+        std::cout << "\n[whyWhale] \u2713 Model " << model << " is ready!\n";
         return true;
     }
 
-    std::cerr << "[whyWhale] ✗ Failed to pull model. Check your internet connection.\n";
+    std::cerr << "[whyWhale] \u2717 Failed to pull model. Check your internet connection.\n";
     return false;
 }

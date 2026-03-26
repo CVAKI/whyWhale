@@ -7,13 +7,11 @@
 
 class EditorUI {
 public:
-    // Print the whyWhale ASCII banner
     void showBanner();
 
-    // Print a section separator
-    void separator(char c = '-', int width = 60);
+    // Use std::string for fill character so Unicode box-drawing chars work
+    void separator(const std::string& c = "-", int width = 60);
 
-    // Main run loop — handles all user interaction
     void run(const std::string& model);
 
 private:
