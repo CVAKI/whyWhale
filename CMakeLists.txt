@@ -4,8 +4,9 @@ project(whyWhale CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── Auto-download nlohmann/json into a proper nlohmann/ subfolder ─────────────
 include(FetchContent)
+
+# ── nlohmann/json ─────────────────────────────────────────────────────────────
 FetchContent_Declare(
         nlohmann_json
         URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
@@ -14,7 +15,45 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-# ── Sources ───────────────────────────────────────────────────────────────────
+# ── GLFW (window + OpenGL context) ───────────────────────────────────────────
+set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+        glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG        3.4
+)
+FetchContent_MakeAvailable(glfw)
+
+# ── Dear ImGui (docking branch — required for panel layout) ──────────────────
+FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        docking
+)
+FetchContent_MakeAvailable(imgui)
+
+find_package(OpenGL REQUIRED)
+
+# ImGui has no CMakeLists — compile its sources manually as a static lib
+add_library(imgui_impl STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_demo.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui_impl PUBLIC
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui_impl PUBLIC glfw OpenGL::GL)
+
+# ── Main executable ───────────────────────────────────────────────────────────
 add_executable(whyWhale
         main.cpp
         src/ai_engine.cpp
@@ -24,29 +63,43 @@ add_executable(whyWhale
         src/ollama_manager.cpp
 )
 
-# ── Include paths ─────────────────────────────────────────────────────────────
 target_include_directories(whyWhale PRIVATE
         ${CMAKE_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_BINARY_DIR}/nlohmann_include
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
 )
 
-# ── Windows-specific settings ─────────────────────────────────────────────────
-if(WIN32)
-    # ws2_32  = Winsock (TCP socket check)
-    # shell32 = ShellExecuteEx (silent installer launch)
-    target_link_libraries(whyWhale PRIVATE ws2_32 shell32)
+target_link_libraries(whyWhale PRIVATE
+        imgui_impl
+        glfw
+        OpenGL::GL
+)
+# ── stb_image (single-header image loader) ───────────────────────────────────
+FetchContent_Declare(
+        stb
+        GIT_REPOSITORY https://github.com/nothings/stb.git
+        GIT_TAG        master
+)
+FetchContent_MakeAvailable(stb)
 
+target_include_directories(whyWhale PRIVATE
+        ${stb_SOURCE_DIR}
+)
+
+# ── Platform specifics ────────────────────────────────────────────────────────
+if(WIN32)
+    target_link_libraries(whyWhale PRIVATE ws2_32 shell32 opengl32)
     if(MSVC)
         target_compile_options(whyWhale PRIVATE /utf-8 /W3)
     else()
         target_compile_options(whyWhale PRIVATE -municode -Wall -Wextra)
     endif()
-
-    set_target_properties(whyWhale PROPERTIES WIN32_EXECUTABLE FALSE)
+    # TRUE = hides the black console window on launch
+    set_target_properties(whyWhale PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
-# ── Release build optimisations ───────────────────────────────────────────────
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(MSVC)
         target_compile_options(whyWhale PRIVATE /O2)
@@ -55,4 +108,4 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     endif()
 endif()
 
-message(STATUS "whyWhale: CMake configured. Build with Ctrl+F9 in CLion.")
+message(STATUS "whyWhale: ImGui + GLFW IDE build configured.")
