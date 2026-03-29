@@ -40,7 +40,8 @@
 
 **Option 1 — Global install (recommended)**
 ```bash
-cd whyWhale_v4
+git clone https://github.com/CVAKI/whyWhale.git
+cd whyWhale
 npm install -g .
 whywhale
 ```
