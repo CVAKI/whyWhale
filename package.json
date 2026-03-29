@@ -1,0 +1,29 @@
+{
+  "name": "whywhale",
+  "version": "4.0.0",
+  "description": "🐋 whyWhale — AI-powered terminal assistant with self-testing brain, persistent memory, skills, and shell passthrough",
+  "main": "bin/whywhale.js",
+  "bin": {
+    "whywhale": "./bin/whywhale.js",
+    "ww": "./bin/whywhale.js"
+  },
+  "scripts": {
+    "start": "node bin/whywhale.js"
+  },
+  "keywords": [
+    "ai",
+    "terminal",
+    "cli",
+    "claude",
+    "anthropic",
+    "assistant",
+    "code",
+    "whale"
+  ],
+  "author": "CVKI",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}
