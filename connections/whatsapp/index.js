@@ -54,14 +54,16 @@ async function startWhatsApp(opts = {}) {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      log.info(`${colors.cyan}┌─────────────────────────────────────┐`);
-      log.info(`│  Scan the QR code with WhatsApp:     │`);
-      log.info(`│  Settings → Linked Devices → Link a Device │`);
-      log.info(`└─────────────────────────────────────┘${colors.reset}`);
+      const G = colors.waGreen + colors.bold;
+      const R = colors.reset;
+      console.log(`\n  ${G}┌──────────────────────────────────────────────┐${R}`);
+      console.log(`  ${G}│${R}  ${colors.waLight}📱  Scan QR with WhatsApp:${R}                  ${G}│${R}`);
+      console.log(`  ${G}│${R}  ${colors.grey}Settings → Linked Devices → Link a Device${R}  ${G}│${R}`);
+      console.log(`  ${G}└──────────────────────────────────────────────┘${R}\n`);
     }
 
     if (connection === 'open') {
-      log.success('WhatsApp connected ✅');
+      log.success('WhatsApp connected ✅  — messages will be relayed to the AI pipeline');
     }
 
     if (connection === 'close') {

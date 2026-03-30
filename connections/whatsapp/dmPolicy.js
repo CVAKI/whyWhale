@@ -15,7 +15,7 @@
  * For persistence, swap the Map for a JSON file write.
  */
 
-const { log } = require('./logger');
+const { log, colors } = require('./logger');
 const crypto  = require('crypto');
 
 // ─── Pairing state ────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ async function handlePairing({ sender, text, allowFrom, sock }) {
     if (expired) {
       pairingTable.delete(sender);
       await sock.sendMessage(sender, {
-        text: '⏰ Your pairing code expired. Send any message to request a new one.',
+        text: '🟢 Your pairing code expired. Send any message to request a new one.',
       });
       return false;
     }
@@ -81,14 +81,14 @@ async function handlePairing({ sender, text, allowFrom, sock }) {
       entry.approved = true;
       log.success(`Sender approved via pairing: ${sender}`);
       await sock.sendMessage(sender, {
-        text: '✅ Pairing successful! You can now chat with whyWhale.',
+        text: '✅ *Pairing successful!*\n\n🟢 You\'re now connected to whyWhale.\nStart chatting anytime.',
       });
       return true;
     }
 
     // Wrong code
     await sock.sendMessage(sender, {
-      text: `❌ Incorrect code. Your code is: *${entry.code}*\nIt expires in ${remaining(entry.expiresAt)}.`,
+      text: `❌ Incorrect code.\n\n🔑 Your code is: *${entry.code}*\n⏱ Expires in ${remaining(entry.expiresAt)}.`,
     });
     return false;
   }
@@ -105,9 +105,14 @@ async function handlePairing({ sender, text, allowFrom, sock }) {
 
   await sock.sendMessage(sender, {
     text: [
+      '🐋 *whyWhale* — AI Terminal Assistant',
+      '━━━━━━━━━━━━━━━━━━━━━━━━━━━',
       '👋 Hello! This bot requires a pairing code.',
-      `Your code is: *${code}*`,
-      'Reply with this code to continue (valid for 10 minutes).',
+      '',
+      `🔑 Your code: *${code}*`,
+      '',
+      'Reply with this code to get started.',
+      '⏱ Valid for 10 minutes.',
     ].join('\n'),
   });
 
