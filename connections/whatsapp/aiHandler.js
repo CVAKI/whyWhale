@@ -25,7 +25,7 @@ function setContext(ctx) {
 
 // ─── Conversation history per-sender (simple rolling window) ─────────────────
 const histories = new Map();
-const MAX_HISTORY = 20; // messages to keep per sender
+const MAX_HISTORY = 20;
 
 function getHistory(sender) {
   if (!histories.has(sender)) histories.set(sender, []);
@@ -40,18 +40,28 @@ function pushHistory(sender, role, content) {
 
 // ─── Main entry ───────────────────────────────────────────────────────────────
 async function getAIResponse(userMessage, sender = 'unknown') {
-  // ── 1. Try integrated path first ──────────────────────────────────────────
   if (_ctx && _ctx.prov) {
     return integratedResponse(userMessage, sender);
   }
-
-  // ── 2. Standalone path ────────────────────────────────────────────────────
   return standaloneResponse(userMessage, sender);
 }
 
 // ─── Integrated: uses full whyWhale ctx ───────────────────────────────────────
 async function integratedResponse(userMessage, sender) {
-  const { handleAiMessage } = require('../../lib/main/aiHandler');
+  // Safely resolve handleAiMessage — export name may differ across versions
+  let handleAiMessage;
+  try {
+    const mod = require('../../lib/main/aiHandler');
+    handleAiMessage = mod.handleAiMessage || mod.default || mod;
+    if (typeof handleAiMessage !== 'function') handleAiMessage = null;
+  } catch (_) {
+    handleAiMessage = null;
+  }
+
+  // If the integrated handler isn't available, fall back to standalone
+  if (!handleAiMessage) {
+    return standaloneResponse(userMessage, sender);
+  }
 
   // Temporarily swap ctx messages with this sender's history
   const original = _ctx.messages;
@@ -59,14 +69,16 @@ async function integratedResponse(userMessage, sender) {
 
   let reply = '';
   const origWrite = process.stdout.write.bind(process.stdout);
-
-  // Capture streamed output instead of printing to terminal
   const chunks = [];
   process.stdout.write = (chunk) => { chunks.push(String(chunk)); return true; };
 
   try {
     await handleAiMessage(_ctx, userMessage);
     reply = _ctx.lastReply || chunks.join('').replace(/\x1b\[[0-9;]*m/g, '').trim();
+  } catch (err) {
+    // If pipeline throws, fall through to standalone
+    process.stdout.write = origWrite;
+    return standaloneResponse(userMessage, sender);
   } finally {
     process.stdout.write = origWrite;
     _ctx.messages = original;
@@ -83,9 +95,9 @@ async function standaloneResponse(userMessage, sender) {
   const cfg = loadConfig();
   const mem = loadMemory();
 
-  const provider  = process.env.WA_PROVIDER  || cfg.provider  || 'anthropic';
-  const model     = process.env.WA_MODEL      || cfg.model     || 'claude-sonnet-4-20250514';
-  const apiKey    = process.env.WA_API_KEY    || cfg.apiKey    || '';
+  const provider = process.env.WA_PROVIDER || cfg.provider  || 'anthropic';
+  const model    = process.env.WA_MODEL    || cfg.model     || 'claude-sonnet-4-20250514';
+  const apiKey   = process.env.WA_API_KEY  || cfg.apiKey    || '';
 
   if (!apiKey && provider !== 'ollama') {
     return '⚠️ No API key configured. Run `whywhale --setup` or set WA_API_KEY.';
@@ -129,12 +141,7 @@ async function callAnthropic({ apiKey, model, systemPrompt, messages }) {
       'x-api-key':         apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: 1024,
-      system:     systemPrompt,
-      messages,
-    }),
+    body: JSON.stringify({ model, max_tokens: 1024, system: systemPrompt, messages }),
   });
 
   if (!res.ok) {
@@ -149,14 +156,8 @@ async function callAnthropic({ apiKey, model, systemPrompt, messages }) {
 async function callOpenRouter({ apiKey, model, systemPrompt, messages }) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages],
-    }),
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify({ model, messages: [{ role: 'system', content: systemPrompt }, ...messages] }),
   });
 
   if (!res.ok) throw new Error(`OpenRouter error ${res.status}: ${await res.text()}`);
@@ -167,14 +168,8 @@ async function callOpenRouter({ apiKey, model, systemPrompt, messages }) {
 async function callGroq({ apiKey, model, systemPrompt, messages }) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages],
-    }),
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify({ model, messages: [{ role: 'system', content: systemPrompt }, ...messages] }),
   });
 
   if (!res.ok) throw new Error(`Groq error ${res.status}: ${await res.text()}`);
