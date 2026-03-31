@@ -3,11 +3,29 @@
 /**
  * whyWhale — WhatsApp Connection (Baileys)
  *
- * Fixes:
- *  - Logout from phone → notify user, DON'T spam QR, ask them to /wp
- *  - 408 timeout      → max 3 retries, then stop and notify
- *  - resetSession()   → exported for /wa --reset command
- *  - onDisconnected() → callback so main can print prompt / notify user
+ * ALL FIXES (5 total):
+ *
+ *  Fix 1 — Singleton guard was blocking auto-reconnects (408/401/403).
+ *           _isRunning was never reset before calling startWhatsApp() inside
+ *           retry paths. Now it is.
+ *
+ *  Fix 2 — "Closing session: SessionEntry" log spam leaked to terminal.
+ *           Baileys emits those via console.log (stdout), not stderr.
+ *           Now stdout.write is also filtered for noisy signal-protocol lines.
+ *
+ *  Fix 3 — Code 440 (session-replaced) ended the session permanently.
+ *           Now auto-retries once after 15 s so that if the conflicting
+ *           standalone process has been killed by then, reconnect succeeds.
+ *
+ *  Fix 4 — Self-chat ("Message yourself") was silently ignored because
+ *           every incoming self-message has key.fromMe = true.
+ *           Now self-chat messages are allowed through; a _sentByBot Set
+ *           tracks IDs of messages the bot itself sent so those are skipped,
+ *           preventing reply loops.
+ *
+ *  Fix 5 — Farewell message was sent twice on /exit because
+ *           sendFarewellMessage() was called from two places in main.
+ *           A _farewellSent flag now makes it a one-shot operation.
  */
 
 const {
@@ -30,11 +48,45 @@ const { log, colors }   = require('./logger');
 const AUTH_DIR         = path.join(os.homedir(), '.whywhale', 'credentials', 'whatsapp');
 const SESSION_ID       = 'session';
 const CONNECTIONS_PATH = path.join(os.homedir(), '.whywhale_connections.json');
+const MAX_RETRIES      = 3;
+const RETRY_440_MS     = 15_000;
 
-// Max auto-reconnect attempts before giving up and asking the user to reconnect manually
-const MAX_RETRIES = 3;
+// ─── Fix 2: Stdout filter — suppress noisy Baileys signal-protocol dumps ──────
+(function installStdoutFilter() {
+  const NOISE = [
+    'Closing session:',
+    'Closing open session',
+    'SessionEntry',
+    'Bad MAC',
+    'Failed to decrypt',
+    'registrationId:',
+    'currentRatchet:',
+    'indexInfo:',
+    '_chains:',
+    'chainKey:',
+    'chainType:',
+    'messageKeys:',
+    'ephemeralKeyPair:',
+    'lastRemoteEphemeralKey:',
+    'previousCounter:',
+    'rootKey:',
+    'baseKey:',
+    'baseKeyType:',
+    'remoteIdentityKey:',
+  ];
+  const _orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = function (chunk, encodingOrCb, cb) {
+    const s = Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk);
+    if (NOISE.some(n => s.includes(n))) {
+      if (typeof encodingOrCb === 'function') encodingOrCb();
+      else if (typeof cb === 'function') cb();
+      return true;
+    }
+    return _orig(chunk, encodingOrCb, cb);
+  };
+})();
 
-// ─── Wipe local session (called on Bad MAC / logout / reset) ─────────────────
+// ─── Wipe local session ────────────────────────────────────────────────────────
 function wipeSession() {
   const sessionPath = path.join(AUTH_DIR, SESSION_ID);
   try {
@@ -50,13 +102,14 @@ function wipeSession() {
 // ─── Reset session (exported — called by /wa --reset) ────────────────────────
 function resetSession() {
   wipeSession();
-  _activeSock  = null;
-  _startupSent = false;
-  _ownerJid    = null;
-  _retryCount  = 0;
-  _isRunning   = false;
+  _activeSock   = null;
+  _startupSent  = false;
+  _ownerJid     = null;
+  _retryCount   = 0;
+  _isRunning    = false;
+  _farewellSent = false;
+  _sentByBot.clear();
 
-  // Update connections file — mark as disconnected so banner reflects reality
   try {
     if (fs.existsSync(CONNECTIONS_PATH)) {
       const data = JSON.parse(fs.readFileSync(CONNECTIONS_PATH, 'utf8'));
@@ -68,7 +121,7 @@ function resetSession() {
   } catch (_) {}
 }
 
-// ─── Load owner number from saved connections ─────────────────────────────────
+// ─── Load owner number ─────────────────────────────────────────────────────────
 function loadOwnerNumber() {
   try {
     if (fs.existsSync(CONNECTIONS_PATH)) {
@@ -79,27 +132,29 @@ function loadOwnerNumber() {
   return '';
 }
 
-// Build a Baileys-style JID from a plain phone number
 function toJid(number) {
   const clean = number.replace(/\D/g, '');
   if (!clean) return null;
   return clean + '@s.whatsapp.net';
 }
 
-// ─── Startup / shutdown message text ─────────────────────────────────────────
+// ─── Messages ─────────────────────────────────────────────────────────────────
 const MSG_ONLINE  = '🐋 *whyWhale is swimming* 🌊\n\nI\'m online and ready!\nSend me any message or terminal command and I\'ll get it done.';
 const MSG_OFFLINE = '🎣 *whyWhale is going to catch fish...* 🐟\n\nI\'m shutting down now. I\'ll message you again when I\'m back online!';
 
 // ─── Module-level state ───────────────────────────────────────────────────────
-let _activeSock  = null;
-let _ownerJid    = null;
-let _startupSent = false;
-let _retryCount  = 0;       // consecutive reconnect attempts
-let _isRunning   = false;   // singleton guard — prevents double-connect (e.g. setup + autoStart)
+let _activeSock   = null;
+let _ownerJid     = null;
+let _startupSent  = false;
+let _retryCount   = 0;
+let _isRunning    = false;
+let _farewellSent = false;         // Fix 5: one-shot guard
+const _sentByBot  = new Set();     // Fix 4: bot-sent message ID tracker
 
-// ─── Send farewell message (exported — called by main on rl.close) ────────────
+// ─── Fix 5: One-shot farewell ──────────────────────────────────────────────────
 async function sendFarewellMessage() {
-  if (!_activeSock || !_ownerJid) return;
+  if (!_activeSock || !_ownerJid || _farewellSent) return;
+  _farewellSent = true;
   try {
     await _activeSock.sendMessage(_ownerJid, { text: MSG_OFFLINE });
     log.info('Farewell message sent to owner.');
@@ -108,7 +163,7 @@ async function sendFarewellMessage() {
   }
 }
 
-// ─── Helper: print a clean "disconnected" notice ────────────────────────────
+// ─── Disconnect notice ────────────────────────────────────────────────────────
 function printDisconnectNotice(reason) {
   const Y  = '\x1b[38;5;226m';
   const G  = '\x1b[38;5;35m';
@@ -126,9 +181,6 @@ function printDisconnectNotice(reason) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function startWhatsApp(opts = {}) {
-  // Singleton guard — if a session is already active or being established, skip.
-  // This prevents autoStartConnections from spawning a second session when
-  // setupWhatsApp already connected during the setup wizard.
   if (_isRunning) {
     log.info('startWhatsApp called but session already active — skipping duplicate start.');
     if (typeof opts.onConnected === 'function' && _activeSock) opts.onConnected();
@@ -144,9 +196,9 @@ async function startWhatsApp(opts = {}) {
 
   log.info(`Using WA version ${version.join('.')}`);
 
-  // Refresh owner JID on every connect (may change after /wa owner or /wp)
   const ownerNumber = loadOwnerNumber();
-  _ownerJid = toJid(ownerNumber);
+  _ownerJid     = toJid(ownerNumber);
+  _farewellSent = false;   // reset on each fresh connect
 
   if (!_ownerJid) {
     log.warn('No owner number set — replying to ALL messages. Run /wp to set your number.');
@@ -163,11 +215,9 @@ async function startWhatsApp(opts = {}) {
 
   _activeSock  = sock;
   _startupSent = false;
+  _sentByBot.clear();
 
-  // ── Persist credentials ───────────────────────────────────────────────────
-  sock.ev.on('creds.update', saveCreds);
-
-  // ── Suppress noisy libsignal decrypt logs to stderr ──────────────────────
+  // Suppress Baileys stderr noise
   const _origStderrWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk, ...args) => {
     const s = typeof chunk === 'string' ? chunk : chunk.toString();
@@ -179,11 +229,12 @@ async function startWhatsApp(opts = {}) {
     return _origStderrWrite(chunk, ...args);
   };
 
+  sock.ev.on('creds.update', saveCreds);
+
   // ── Connection lifecycle ──────────────────────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // ── Render QR code ────────────────────────────────────────────────────
     if (qr) {
       const G = colors.waGreen + colors.bold;
       const R = colors.reset;
@@ -197,19 +248,16 @@ async function startWhatsApp(opts = {}) {
     }
 
     if (connection === 'open') {
-      // Reset retry counter on successful connection
       _retryCount = 0;
       log.success('WhatsApp connected ✅  — relaying messages to the AI pipeline');
-
-      // Always fire onConnected so callers (e.g. setup wizard) can proceed
       if (typeof onConnected === 'function') onConnected();
 
-      // Only send startup message when an owner is registered
       if (_ownerJid && !_startupSent) {
         _startupSent = true;
         try {
           await sleep(1500);
-          await sock.sendMessage(_ownerJid, { text: MSG_ONLINE });
+          const sent = await sock.sendMessage(_ownerJid, { text: MSG_ONLINE });
+          if (sent?.key?.id) _sentByBot.add(sent.key.id);
           log.info('Startup message sent to owner.');
         } catch (err) {
           log.error('Could not send startup message: ' + err.message);
@@ -225,46 +273,46 @@ async function startWhatsApp(opts = {}) {
       _activeSock  = null;
       _startupSent = false;
 
-      // ── Case 1: User logged out from phone ─────────────────────────────
+      // Case 1: Logged out from phone
       if (loggedOut) {
         wipeSession();
         _retryCount = 0;
         _isRunning  = false;
         printDisconnectNotice('you logged out from your phone');
         if (typeof onDisconnected === 'function') onDisconnected('loggedOut');
-        // DO NOT auto-restart — user must /wp or /wa --reset
         return;
       }
 
-      // ── Case 2: Session replaced by another WA Web session ─────────────
+      // Fix 3 — Case 2: Session replaced (440) — auto-retry after delay
       if (code === 440) {
         const Y  = '\x1b[38;5;226m';
-        const G  = '\x1b[38;5;35m';
         const GR = '\x1b[38;5;245m';
         const R  = '\x1b[0m';
         console.log('');
         console.log('  ' + Y + '⚠ WhatsApp: session replaced (code 440).' + R);
-        console.log('  ' + GR + 'Another WhatsApp Web session took over this account.' + R);
+        console.log('  ' + GR + 'Another WhatsApp Web / standalone session took over.' + R);
         console.log('  ' + GR + 'Fix: phone → Linked Devices → remove extra sessions.' + R);
-        console.log('  ' + GR + 'Then run ' + R + G + '/wp' + R + GR + ' to reconnect.' + R);
+        console.log('  ' + GR + 'Auto-retrying in ' + (RETRY_440_MS / 1000) + 's …' + R);
         console.log('');
-        _isRunning = false;
-        if (typeof onDisconnected === 'function') onDisconnected('replaced');
+        _retryCount = 0;
+        _isRunning  = false;   // Fix 1
+        await sleep(RETRY_440_MS);
+        if (!_isRunning) startWhatsApp(opts);
         return;
       }
 
-      // ── Case 3: Auth error — wipe and retry once ────────────────────────
+      // Fix 1 — Case 3: Auth error
       if (code === 401 || code === 403) {
         log.warn(`Auth error (code ${code}) — wiping session, will show fresh QR.`);
         wipeSession();
         _retryCount = 0;
+        _isRunning  = false;   // Fix 1: was missing
         await sleep(2000);
         startWhatsApp(opts);
         return;
       }
 
-      // ── Case 4: All other disconnects (408 timeout, network, etc.) ───────
-      // Retry up to MAX_RETRIES, then stop and ask user to reconnect manually
+      // Fix 1 — Case 4: Network / timeout — retry up to MAX_RETRIES
       _retryCount++;
       if (_retryCount > MAX_RETRIES) {
         _retryCount = 0;
@@ -273,9 +321,9 @@ async function startWhatsApp(opts = {}) {
         if (typeof onDisconnected === 'function') onDisconnected('maxRetries');
         return;
       }
-
       const delay = 3000 * _retryCount;
       log.warn(`Connection closed (code ${code}). Reconnecting (${_retryCount}/${MAX_RETRIES}) in ${delay / 1000}s…`);
+      _isRunning = false;      // Fix 1: was missing
       await sleep(delay);
       startWhatsApp(opts);
     }
@@ -286,14 +334,27 @@ async function startWhatsApp(opts = {}) {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message) continue;
 
-      const sender = msg.key.remoteJid;
-      const text   = extractText(msg);
+      const sender     = msg.key.remoteJid;
+      const isSelfChat = !!(_ownerJid && sender === _ownerJid);
 
+      // Fix 4: fromMe handling
+      if (msg.key.fromMe) {
+        if (_sentByBot.has(msg.key.id)) {
+          // Bot's own reply — skip to prevent loop
+          _sentByBot.delete(msg.key.id);
+          continue;
+        }
+        // Non-self-chat: skip all other fromMe messages
+        if (!isSelfChat) continue;
+        // Self-chat: fall through — process as user input
+      }
+
+      const text = extractText(msg);
       if (!text) continue;
 
-      // Owner gate: only the registered owner may interact
+      // Owner gate
       if (_ownerJid && sender !== _ownerJid) {
         log.info(`Ignored message from non-owner: ${sender}`);
         continue;
@@ -306,14 +367,16 @@ async function startWhatsApp(opts = {}) {
         const fullReply = await getAIResponse(text, sender);
         const reply     = buildWhatsAppReply(text, fullReply);
         await sock.sendPresenceUpdate('paused', sender);
-        await sock.sendMessage(sender, { text: reply }, { quoted: msg });
+        const sent = await sock.sendMessage(sender, { text: reply }, { quoted: msg });
+        if (sent?.key?.id) _sentByBot.add(sent.key.id);
         log.outgoing(sender, reply);
       } catch (err) {
         log.error(`AI handler error: ${err.message}`);
         await sock.sendPresenceUpdate('paused', sender);
-        await sock.sendMessage(sender, {
+        const errSent = await sock.sendMessage(sender, {
           text: '⚠️ Something went wrong. Try again in a moment.',
         });
+        if (errSent?.key?.id) _sentByBot.add(errSent.key.id);
       }
     }
   });
@@ -340,9 +403,7 @@ function buildWhatsAppReply(userInput, aiReply) {
   if (savedMem  > 0) parts.push(`💾 ${savedMem} memory update${savedMem > 1 ? 's' : ''}`);
 
   let header = '';
-  if (parts.length > 0) {
-    header = '✅ *Done* — ' + parts.join(' · ') + '\n\n';
-  }
+  if (parts.length > 0) header = '✅ *Done* — ' + parts.join(' · ') + '\n\n';
 
   const MAX = 1500;
   if (clean.length > MAX) {
