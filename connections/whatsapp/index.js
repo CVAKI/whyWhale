@@ -3,29 +3,24 @@
 /**
  * whyWhale — WhatsApp Connection (Baileys)
  *
- * ALL FIXES (5 total):
+ * FIXES & CHANGES in this version:
  *
- *  Fix 1 — Singleton guard was blocking auto-reconnects (408/401/403).
- *           _isRunning was never reset before calling startWhatsApp() inside
- *           retry paths. Now it is.
+ *  Fix 1 — Singleton guard reset for auto-reconnects (408/401/403).
+ *  Fix 2 — Stdout filter suppresses noisy Baileys signal-protocol dumps.
+ *  Fix 3 — Code 440 (session-replaced) auto-retries once after 15s.
+ *  Fix 4 — Self-chat allowed through; _sentByBot set prevents reply loops.
+ *  Fix 5 — Farewell message one-shot guard (_farewellSent flag).
  *
- *  Fix 2 — "Closing session: SessionEntry" log spam leaked to terminal.
- *           Baileys emits those via console.log (stdout), not stderr.
- *           Now stdout.write is also filtered for noisy signal-protocol lines.
- *
- *  Fix 3 — Code 440 (session-replaced) ended the session permanently.
- *           Now auto-retries once after 15 s so that if the conflicting
- *           standalone process has been killed by then, reconnect succeeds.
- *
- *  Fix 4 — Self-chat ("Message yourself") was silently ignored because
- *           every incoming self-message has key.fromMe = true.
- *           Now self-chat messages are allowed through; a _sentByBot Set
- *           tracks IDs of messages the bot itself sent so those are skipped,
- *           preventing reply loops.
- *
- *  Fix 5 — Farewell message was sent twice on /exit because
- *           sendFarewellMessage() was called from two places in main.
- *           A _farewellSent flag now makes it a one-shot operation.
+ *  NEW — Section theme display:
+ *    · When WA is connected but idle, terminal shows normal PS1.
+ *    · When a message arrives, the logger opens a ┌═══ section block.
+ *    · Each message/reply is rendered as ┟══ lines inside the section.
+ *    · When the AI decides to do work (file ops, shell commands),
+ *      the section closes with @END-> going to terminal for work,
+ *      and the terminal returns to its normal PS1 while work runs.
+ *    · When the AI sends a file, section closes with @END->to sending.
+ *    · If no work is triggered (pure chat), section closes @OnGoing->chatting.
+ *    · A new section with an incremented number opens on the next message.
  */
 
 const {
@@ -41,8 +36,8 @@ const os        = require('os');
 const pino      = require('pino');
 const qrcode    = require('qrcode-terminal');
 
-const { getAIResponse } = require('./aiHandler');
-const { log, colors }   = require('./logger');
+const { getAIResponse, executeWork } = require('./aiHandler');
+const { log, colors }                = require('./logger');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const AUTH_DIR         = path.join(os.homedir(), '.whywhale', 'credentials', 'whatsapp');
@@ -51,28 +46,14 @@ const CONNECTIONS_PATH = path.join(os.homedir(), '.whywhale_connections.json');
 const MAX_RETRIES      = 3;
 const RETRY_440_MS     = 15_000;
 
-// ─── Fix 2: Stdout filter — suppress noisy Baileys signal-protocol dumps ──────
+// ─── Fix 2: Stdout filter ─────────────────────────────────────────────────────
 (function installStdoutFilter() {
   const NOISE = [
-    'Closing session:',
-    'Closing open session',
-    'SessionEntry',
-    'Bad MAC',
-    'Failed to decrypt',
-    'registrationId:',
-    'currentRatchet:',
-    'indexInfo:',
-    '_chains:',
-    'chainKey:',
-    'chainType:',
-    'messageKeys:',
-    'ephemeralKeyPair:',
-    'lastRemoteEphemeralKey:',
-    'previousCounter:',
-    'rootKey:',
-    'baseKey:',
-    'baseKeyType:',
-    'remoteIdentityKey:',
+    'Closing session:', 'Closing open session', 'SessionEntry',
+    'Bad MAC', 'Failed to decrypt', 'registrationId:', 'currentRatchet:',
+    'indexInfo:', '_chains:', 'chainKey:', 'chainType:', 'messageKeys:',
+    'ephemeralKeyPair:', 'lastRemoteEphemeralKey:', 'previousCounter:',
+    'rootKey:', 'baseKey:', 'baseKeyType:', 'remoteIdentityKey:',
   ];
   const _orig = process.stdout.write.bind(process.stdout);
   process.stdout.write = function (chunk, encodingOrCb, cb) {
@@ -86,30 +67,24 @@ const RETRY_440_MS     = 15_000;
   };
 })();
 
-// ─── Wipe local session ────────────────────────────────────────────────────────
+// ─── Session management ───────────────────────────────────────────────────────
 function wipeSession() {
   const sessionPath = path.join(AUTH_DIR, SESSION_ID);
   try {
     if (fs.existsSync(sessionPath)) {
       fs.rmSync(sessionPath, { recursive: true, force: true });
-      console.log('  \x1b[38;5;226m⚠ Session wiped — will require fresh QR scan to reconnect.\x1b[0m');
+      console.log('  \x1b[38;5;226m⚠ Session wiped — will require fresh QR scan.\x1b[0m');
     }
   } catch (e) {
     console.log('  \x1b[38;5;203m✘ Could not wipe session: ' + e.message + '\x1b[0m');
   }
 }
 
-// ─── Reset session (exported — called by /wa --reset) ────────────────────────
 function resetSession() {
   wipeSession();
-  _activeSock   = null;
-  _startupSent  = false;
-  _ownerJid     = null;
-  _retryCount   = 0;
-  _isRunning    = false;
-  _farewellSent = false;
+  _activeSock = null; _startupSent = false; _ownerJid = null;
+  _retryCount = 0; _isRunning = false; _farewellSent = false;
   _sentByBot.clear();
-
   try {
     if (fs.existsSync(CONNECTIONS_PATH)) {
       const data = JSON.parse(fs.readFileSync(CONNECTIONS_PATH, 'utf8'));
@@ -121,7 +96,6 @@ function resetSession() {
   } catch (_) {}
 }
 
-// ─── Load owner number ─────────────────────────────────────────────────────────
 function loadOwnerNumber() {
   try {
     if (fs.existsSync(CONNECTIONS_PATH)) {
@@ -134,8 +108,7 @@ function loadOwnerNumber() {
 
 function toJid(number) {
   const clean = number.replace(/\D/g, '');
-  if (!clean) return null;
-  return clean + '@s.whatsapp.net';
+  return clean ? clean + '@s.whatsapp.net' : null;
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
@@ -148,10 +121,10 @@ let _ownerJid     = null;
 let _startupSent  = false;
 let _retryCount   = 0;
 let _isRunning    = false;
-let _farewellSent = false;         // Fix 5: one-shot guard
-const _sentByBot  = new Set();     // Fix 4: bot-sent message ID tracker
+let _farewellSent = false;
+const _sentByBot  = new Set();
 
-// ─── Fix 5: One-shot farewell ──────────────────────────────────────────────────
+// ─── Farewell ─────────────────────────────────────────────────────────────────
 async function sendFarewellMessage() {
   if (!_activeSock || !_ownerJid || _farewellSent) return;
   _farewellSent = true;
@@ -173,11 +146,14 @@ function printDisconnectNotice(reason) {
   console.log('  ' + Y + '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' + R);
   console.log('  ' + Y + '⚠  WhatsApp disconnected' + (reason ? ' — ' + reason : '') + R);
   console.log('  ' + GR + '  To reconnect, type:' + R);
-  console.log('  ' + G  + '    /wp' + R + GR + '          — re-link your account (shows QR)' + R);
-  console.log('  ' + G  + '    /wa --reset' + R + GR + '  — wipe session and start fresh' + R);
+  console.log('  ' + G  + '    /wp'          + R + GR + '          — re-link your account (shows QR)' + R);
+  console.log('  ' + G  + '    /wa --reset'  + R + GR + '  — wipe session and start fresh' + R);
   console.log('  ' + Y + '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' + R);
   console.log('');
 }
+
+
+
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function startWhatsApp(opts = {}) {
@@ -198,7 +174,7 @@ async function startWhatsApp(opts = {}) {
 
   const ownerNumber = loadOwnerNumber();
   _ownerJid     = toJid(ownerNumber);
-  _farewellSent = false;   // reset on each fresh connect
+  _farewellSent = false;
 
   if (!_ownerJid) {
     log.warn('No owner number set — replying to ALL messages. Run /wp to set your number.');
@@ -273,57 +249,44 @@ async function startWhatsApp(opts = {}) {
       _activeSock  = null;
       _startupSent = false;
 
-      // Case 1: Logged out from phone
       if (loggedOut) {
-        wipeSession();
-        _retryCount = 0;
-        _isRunning  = false;
+        wipeSession(); _retryCount = 0; _isRunning = false;
         printDisconnectNotice('you logged out from your phone');
         if (typeof onDisconnected === 'function') onDisconnected('loggedOut');
         return;
       }
 
-      // Fix 3 — Case 2: Session replaced (440) — auto-retry after delay
       if (code === 440) {
-        const Y  = '\x1b[38;5;226m';
-        const GR = '\x1b[38;5;245m';
-        const R  = '\x1b[0m';
+        const Y = '\x1b[38;5;226m', GR = '\x1b[38;5;245m', R = '\x1b[0m';
         console.log('');
         console.log('  ' + Y + '⚠ WhatsApp: session replaced (code 440).' + R);
         console.log('  ' + GR + 'Another WhatsApp Web / standalone session took over.' + R);
-        console.log('  ' + GR + 'Fix: phone → Linked Devices → remove extra sessions.' + R);
         console.log('  ' + GR + 'Auto-retrying in ' + (RETRY_440_MS / 1000) + 's …' + R);
         console.log('');
-        _retryCount = 0;
-        _isRunning  = false;   // Fix 1
+        _retryCount = 0; _isRunning = false;
         await sleep(RETRY_440_MS);
         if (!_isRunning) startWhatsApp(opts);
         return;
       }
 
-      // Fix 1 — Case 3: Auth error
       if (code === 401 || code === 403) {
         log.warn(`Auth error (code ${code}) — wiping session, will show fresh QR.`);
-        wipeSession();
-        _retryCount = 0;
-        _isRunning  = false;   // Fix 1: was missing
+        wipeSession(); _retryCount = 0; _isRunning = false;
         await sleep(2000);
         startWhatsApp(opts);
         return;
       }
 
-      // Fix 1 — Case 4: Network / timeout — retry up to MAX_RETRIES
       _retryCount++;
       if (_retryCount > MAX_RETRIES) {
-        _retryCount = 0;
-        _isRunning  = false;
+        _retryCount = 0; _isRunning = false;
         printDisconnectNotice(`connection failed after ${MAX_RETRIES} attempts (code ${code})`);
         if (typeof onDisconnected === 'function') onDisconnected('maxRetries');
         return;
       }
       const delay = 3000 * _retryCount;
       log.warn(`Connection closed (code ${code}). Reconnecting (${_retryCount}/${MAX_RETRIES}) in ${delay / 1000}s…`);
-      _isRunning = false;      // Fix 1: was missing
+      _isRunning = false;
       await sleep(delay);
       startWhatsApp(opts);
     }
@@ -339,39 +302,63 @@ async function startWhatsApp(opts = {}) {
       const sender     = msg.key.remoteJid;
       const isSelfChat = !!(_ownerJid && sender === _ownerJid);
 
-      // Fix 4: fromMe handling
       if (msg.key.fromMe) {
         if (_sentByBot.has(msg.key.id)) {
-          // Bot's own reply — skip to prevent loop
           _sentByBot.delete(msg.key.id);
           continue;
         }
-        // Non-self-chat: skip all other fromMe messages
         if (!isSelfChat) continue;
-        // Self-chat: fall through — process as user input
       }
 
       const text = extractText(msg);
       if (!text) continue;
 
-      // Owner gate
       if (_ownerJid && sender !== _ownerJid) {
         log.info(`Ignored message from non-owner: ${sender}`);
         continue;
       }
 
+      // ── PHASE 1: Log incoming, get AI plan (stdout suppressed) ────────
       log.incoming(sender, text);
 
       try {
         await sock.sendPresenceUpdate('composing', sender);
-        const fullReply = await getAIResponse(text, sender);
-        const reply     = buildWhatsAppReply(text, fullReply);
+
+        // AI plans the response — returns reply text + parsed directives
+        const { reply, directives, workType } = await getAIResponse(text, sender);
+
+        // ── Log outgoing reply inside the section ───────────────────────
+        log.outgoing(sender, reply);
+
+        // ── Close section with the right status tag ─────────────────────
+        log.closeSection(workType);
+
+        // ── Send the reply to WhatsApp now ──────────────────────────────
         await sock.sendPresenceUpdate('paused', sender);
         const sent = await sock.sendMessage(sender, { text: reply }, { quoted: msg });
         if (sent?.key?.id) _sentByBot.add(sent.key.id);
-        log.outgoing(sender, reply);
+
+        // ── PHASE 2: Execute work visibly in the terminal ───────────────
+        // Only runs when AI produced @@FILE / @@RUN / @@MEMORY directives.
+        // stdout is fully restored here so the user sees the work live.
+        if (workType === 'work' || workType === 'send') {
+          const summary = await executeWork(directives, sender);
+
+          // ── Open a new section to report results back via WA ──────────
+          if (summary.length > 0) {
+            const doneText = '✅ Done!\n\n' + summary.join('\n');
+            log.openSection();
+            log.outgoing(sender, doneText);
+            log.closeSection('chat');
+
+            const doneSent = await sock.sendMessage(sender, { text: doneText });
+            if (doneSent?.key?.id) _sentByBot.add(doneSent.key.id);
+          }
+        }
+
       } catch (err) {
         log.error(`AI handler error: ${err.message}`);
+        if (log.sectionOpen) log.closeSection('end');
         await sock.sendPresenceUpdate('paused', sender);
         const errSent = await sock.sendMessage(sender, {
           text: '⚠️ Something went wrong. Try again in a moment.',
@@ -384,34 +371,8 @@ async function startWhatsApp(opts = {}) {
   return sock;
 }
 
-// ─── Build a WhatsApp-friendly reply ─────────────────────────────────────────
-function buildWhatsAppReply(userInput, aiReply) {
-  if (!aiReply) return '(no response)';
 
-  let clean = aiReply.replace(/\x1b\[[0-9;]*m/g, '').trim();
 
-  const wroteFiles = (clean.match(/@@FILE:/g)  || []).length;
-  const ranCmds    = (clean.match(/@@RUN:/g)   || []).length;
-  const savedMem   = (clean.match(/@@MEMORY:/g)|| []).length;
-
-  clean = clean.replace(/@@(MEMORY|FILE|END|RUN)[^\n]*/g, '').trim();
-  clean = clean.replace(/\n{3,}/g, '\n\n').trim();
-
-  const parts = [];
-  if (wroteFiles > 0) parts.push(`📄 ${wroteFiles} file${wroteFiles > 1 ? 's' : ''} written`);
-  if (ranCmds   > 0) parts.push(`⚡ ${ranCmds} command${ranCmds   > 1 ? 's' : ''} run`);
-  if (savedMem  > 0) parts.push(`💾 ${savedMem} memory update${savedMem > 1 ? 's' : ''}`);
-
-  let header = '';
-  if (parts.length > 0) header = '✅ *Done* — ' + parts.join(' · ') + '\n\n';
-
-  const MAX = 1500;
-  if (clean.length > MAX) {
-    clean = clean.slice(0, MAX) + '\n\n…_(trimmed — see terminal for full output)_';
-  }
-
-  return (header + clean).trim();
-}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractText(msg) {
@@ -424,9 +385,7 @@ function extractText(msg) {
   );
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─── Standalone entry ─────────────────────────────────────────────────────────
 if (require.main === module) {
