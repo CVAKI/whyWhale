@@ -1,5 +1,7 @@
 'use strict';
 
+const { dmGuard } = require('./dmPolicy');
+
 /**
  * whyWhale — WhatsApp Connection (Baileys)
  *
@@ -170,16 +172,17 @@ async function startWhatsApp(opts = {}) {
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
   const { version }          = await fetchLatestBaileysVersion();
 
-  log.info(`Using WA version ${version.join('.')}`);
+  log.openStartupBox('WA startup');
+  log.startupLine('info', `Using WA version ${version.join('.')}`);
 
   const ownerNumber = loadOwnerNumber();
   _ownerJid     = toJid(ownerNumber);
   _farewellSent = false;
 
   if (!_ownerJid) {
-    log.warn('No owner number set — replying to ALL messages. Run /wp to set your number.');
+    log.startupLine('warn', 'No owner number set — replying to ALL messages. Run /wp to set your number.');
   } else {
-    log.info(`Owner JID: ${_ownerJid}`);
+    log.startupLine('info', `Owner JID: ${_ownerJid}`);
   }
 
   const sock = makeWASocket({
@@ -225,7 +228,7 @@ async function startWhatsApp(opts = {}) {
 
     if (connection === 'open') {
       _retryCount = 0;
-      log.success('WhatsApp connected ✅  — relaying messages to the AI pipeline');
+      log.startupLine('success', 'WhatsApp connected ✅  — relaying messages to the AI pipeline');
       if (typeof onConnected === 'function') onConnected();
 
       if (_ownerJid && !_startupSent) {
@@ -234,9 +237,11 @@ async function startWhatsApp(opts = {}) {
           await sleep(1500);
           const sent = await sock.sendMessage(_ownerJid, { text: MSG_ONLINE });
           if (sent?.key?.id) _sentByBot.add(sent.key.id);
-          log.info('Startup message sent to owner.');
+          log.startupLine('info', 'Startup message sent to owner.');
+          log.closeStartupBox();
         } catch (err) {
-          log.error('Could not send startup message: ' + err.message);
+          log.startupLine('error', 'Could not send startup message: ' + err.message);
+          log.closeStartupBox();
         }
       }
     }
@@ -313,9 +318,21 @@ async function startWhatsApp(opts = {}) {
       const text = extractText(msg);
       if (!text) continue;
 
-      if (_ownerJid && sender !== _ownerJid) {
-        log.info(`Ignored message from non-owner: ${sender}`);
-        continue;
+      // Load dmPolicy config (defaults to 'owner-only' if not set)
+      const { whatsapp: waCfg = {} } = require('../../lib/config').loadConfig();
+      const policy    = waCfg.dmPolicy   || 'owner';
+      const allowFrom = waCfg.allowFrom  || [];
+
+      // 'owner' policy: only the registered owner JID is allowed
+      if (policy === 'owner') {
+        if (_ownerJid && sender !== _ownerJid) {
+          log.info(`Ignored message from non-owner: ${sender}`);
+          continue;
+        }
+      } else {
+        // For open / allowlist / pairing — use the full dmGuard logic
+        const allowed = await dmGuard({ sender, text, policy, allowFrom, sock });
+        if (!allowed) continue;
       }
 
       // ── PHASE 1: Log incoming, get AI plan (stdout suppressed) ────────
@@ -342,7 +359,7 @@ async function startWhatsApp(opts = {}) {
         // Only runs when AI produced @@FILE / @@RUN / @@MEMORY directives.
         // stdout is fully restored here so the user sees the work live.
         if (workType === 'work' || workType === 'send') {
-          const summary = await executeWork(directives, sender);
+          const { summary, createdFiles } = await executeWork(directives, sender);
 
           // ── Open a new section to report results back via WA ──────────
           if (summary.length > 0) {
@@ -353,6 +370,32 @@ async function startWhatsApp(opts = {}) {
 
             const doneSent = await sock.sendMessage(sender, { text: doneText });
             if (doneSent?.key?.id) _sentByBot.add(doneSent.key.id);
+          }
+
+          // ── Send each created file as a WA document attachment ────────
+          for (const absPath of createdFiles) {
+            try {
+              const fileName    = path.basename(absPath);
+              const fileBuffer  = fs.readFileSync(absPath);
+              // Pick a readable MIME type for common code files
+              const ext = fileName.split('.').pop().toLowerCase();
+              const mime = {
+                pdf: 'application/pdf',
+                zip: 'application/zip',
+                png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+              }[ext] || 'text/plain';
+
+              log.info(`Sending file to owner: ${fileName}`);
+              const fileSent = await sock.sendMessage(sender, {
+                document: fileBuffer,
+                fileName: fileName,
+                mimetype: mime,
+                caption:  `📄 ${fileName}`,
+              });
+              if (fileSent?.key?.id) _sentByBot.add(fileSent.key.id);
+            } catch (ferr) {
+              log.error(`Could not send file ${path.basename(absPath)}: ${ferr.message}`);
+            }
           }
         }
 
@@ -393,4 +436,14 @@ if (require.main === module) {
     .catch(err => { console.error(err); process.exit(1); });
 }
 
-module.exports = { startWhatsApp, sendFarewellMessage, resetSession };
+// ─── sendToOwner ──────────────────────────────────────────────────────────────
+// Called from the terminal-side aiHandler to notify the owner after work is done.
+async function sendToOwner(text) {
+  if (!_activeSock || !_ownerJid) return;
+  try {
+    const sent = await _activeSock.sendMessage(_ownerJid, { text });
+    if (sent?.key?.id) _sentByBot.add(sent.key.id);
+  } catch (_) {}
+}
+
+module.exports = { startWhatsApp, sendFarewellMessage, resetSession, sendToOwner };

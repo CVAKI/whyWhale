@@ -6,49 +6,34 @@
  * WhatsApp themed terminal display with two visual modes:
  *
  * ── IDLE MODE (WA connected but quiet) ───────────────────────────────────────
- * Normal PS1 prompt identical to the main terminal:
- *   ┌[HH:MM:SS]────[whyWhale]────[</> code]────[0]
- *   └[cwd]──►
+ * Normal PS1 prompt, WA log lines each start on their own fresh line:
+ *   ┌[HH:MM:SS]────[whyWhale]────[◈ agent]────[0]
+ *   └[New folder]──►
+ *   07:53:51 [WA] WhatsApp connected ✅
+ *   07:53:53 [WA] Startup message sent to owner.
+ *   ┌[HH:MM:SS]────[whyWhale]────[◈ agent]────[0]
+ *   └[New folder]──►
  *
  * ── SECTION MODE (WA conversation active) ────────────────────────────────────
- * Double-line (═) border opens when a message arrives:
- *   ┌[HH:MM:SS]════[whyWhale]════════[section :N]
- *   ┟══[whatsapp :[WA ←]:[1 ]::[919562689836  hello]]
- *   ┟══[whatsapp :[WA →]:[2]::[919562689836  hi! how can I help?]]
- *   ...more lines as conversation continues...
- *   └[whatsapp]-[process]::[section @END-> going to terminal for work]
- *   OR
+ *   ┌[HH:MM:SS]════[whyWhale]════════[section :1]
+ *   ┟══[whatsapp :[WA ←]:[ 1]::[919645278065  hi]]
+ *   ┟══[whatsapp :[WA →]:[ 2]::[919645278065  hello!]]
  *   └[whatsapp]-[process]::[section @OnGoing->chatting]
- *   OR
- *   └[whatsapp]-[process]::[section @END->to sending]
- *
- * After the section footer, terminal returns to normal idle PS1.
- * A new section header prints with the next incremented section number
- * when conversation resumes after work is done.
- *
- * Section lifecycle:
- *   openSection()   → print ┌═══ header, reset line counter
- *   logLine()       → print ┟══ message line, increment counter
- *   closeSection()  → print └ footer with status tag, increment section number
  */
 
 const path = require('path');
 const os   = require('os');
 
-// ── Color palette (WhatsApp brand greens + PS1 chrome) ────────────────────────
+// ── Color palette ──────────────────────────────────────────────────────────────
 const colors = {
   reset:    '\x1b[0m',
   bold:     '\x1b[1m',
   dim:      '\x1b[2m',
   italic:   '\x1b[3m',
-
-  // WhatsApp greens
-  waGreen:  '\x1b[38;5;35m',   // #25D366 primary brand green
-  waDark:   '\x1b[38;5;30m',   // #128C7E dark teal
-  waLight:  '\x1b[38;5;157m',  // #DCF8C6 light bubble green
-  waMid:    '\x1b[38;5;42m',   // outgoing blue-green
-
-  // PS1 chrome (matches main terminal render.js)
+  waGreen:  '\x1b[38;5;35m',
+  waDark:   '\x1b[38;5;30m',
+  waLight:  '\x1b[38;5;157m',
+  waMid:    '\x1b[38;5;42m',
   cyan:     '\x1b[38;5;51m',
   blue:     '\x1b[38;5;75m',
   teal:     '\x1b[38;5;43m',
@@ -77,56 +62,47 @@ function cwd() {
   return path.basename(p.startsWith(home) ? '~' + p.slice(home.length) : p) || p;
 }
 
+// ── Safe print: always starts on a fresh line ──────────────────────────────────
+// When readline has printed "└[cwd]──► " on the current line and a WA event
+// fires, we need to move to a new line first, print our message, then move
+// to another new line so readline can reprint its prompt cleanly.
+function safePrint(line) {
+  process.stdout.write('\n' + line + '\n');
+}
+
 // ── Section state ──────────────────────────────────────────────────────────────
-let _sectionNum  = 1;    // increments after each closeSection()
-let _lineCount   = 0;    // resets on openSection()
+let _sectionNum  = 1;
+let _lineCount   = 0;
 let _sectionOpen = false;
 
 // ── Section renderer ───────────────────────────────────────────────────────────
-
-/**
- * Print the ┌═══ section header.
- * Called automatically when the first message of a new section arrives.
- */
 function openSection() {
   _lineCount   = 0;
   _sectionOpen = true;
 
-  const num = _sectionNum;
-  const G   = C.waGreen + B;
-  const CY  = C.cyan;
-  const GR  = C.grey;
-
-  // ┌[HH:MM:SS]════[whyWhale]════════[section :N]
   const line = [
-    CY + '┌',
+    C.cyan + '┌',
     C.waGreen + '[' + R + C.amber + ts() + R + C.waGreen + ']' + R,
     C.waGreen + '════' + R,
     C.waGreen + '[' + R + B + C.white + 'whyWhale' + R + C.waGreen + ']' + R,
     C.waGreen + '════════' + R,
-    C.waGreen + '[' + R + C.waLight + B + 'section :' + num + R + C.waGreen + ']' + R,
+    C.waGreen + '[' + R + C.waLight + B + 'section :' + _sectionNum + R + C.waGreen + ']' + R,
   ].join('');
 
-  console.log('\n' + line);
+  // Section header always starts on its own line
+  process.stdout.write('\n' + line + '\n');
 }
 
-/**
- * Print a ┟══ conversation line.
- * @param {'in'|'out'} direction
- * @param {string} sender   — raw JID, will be cleaned
- * @param {string} text     — message content
- */
 function logLine(direction, sender, text) {
   if (!_sectionOpen) openSection();
 
   _lineCount++;
-  const num    = String(_lineCount).padStart(2, ' ');
-  const arrow  = direction === 'in' ? 'WA ←' : 'WA →';
-  const color  = direction === 'in' ? C.waGreen : C.waMid;
-  const clean  = sender.replace('@s.whatsapp.net', '').replace('@g.us', '');
+  const num     = String(_lineCount).padStart(2, ' ');
+  const arrow   = direction === 'in' ? 'WA ←' : 'WA →';
+  const color   = direction === 'in' ? C.waGreen : C.waMid;
+  const clean   = sender.replace('@s.whatsapp.net', '').replace('@g.us', '');
   const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
 
-  // ┟══[whatsapp :[WA ←]:[N ]::[NUMBER  message]]
   const line = [
     C.waGreen + '┟══' + R,
     C.grey    + '[whatsapp :' + R,
@@ -140,33 +116,24 @@ function logLine(direction, sender, text) {
     C.grey    + ']' + R,
   ].join('');
 
-  console.log(line);
+  // Each message line on its own line (no leading \n — section header already did that)
+  process.stdout.write(line + '\n');
 }
 
-/**
- * Print the └ section footer and increment section number.
- *
- * @param {'work'|'chat'|'send'|'end'} status
- *   'work'  → @END-> going to terminal for work
- *   'send'  → @END->to sending
- *   'chat'  → @OnGoing->chatting
- *   'end'   → @END (generic)
- */
 function closeSection(status = 'chat') {
   if (!_sectionOpen) return;
   _sectionOpen = false;
 
   const tags = {
-    work: `section @END-> going to terminal for work`,
-    send: `section @END->to sending`,
-    chat: `section @OnGoing->chatting`,
-    end:  `section @END`,
+    work: 'section @END-> going to terminal for work',
+    send: 'section @END->to sending',
+    chat: 'section @OnGoing->chatting',
+    end:  'section @END',
   };
 
-  const tag       = tags[status] || tags.chat;
-  const tagColor  = (status === 'chat') ? C.waMid : C.amber;
+  const tag      = tags[status] || tags.chat;
+  const tagColor = (status === 'chat') ? C.waMid : C.amber;
 
-  // └[whatsapp]-[process]::[section @...]
   const line = [
     C.waGreen + '└' + R,
     C.grey    + '[whatsapp]' + R,
@@ -177,23 +144,15 @@ function closeSection(status = 'chat') {
     C.grey    + ']' + R,
   ].join('');
 
-  console.log(line);
-
-  // Increment section number for next conversation burst
+  process.stdout.write(line + '\n');
   _sectionNum++;
 }
 
-// ── Idle PS1 (mirrors main render.js renderPS1 style) ─────────────────────────
-/**
- * Print the normal idle prompt — called after section closes and when WA
- * is connected but no conversation is active.
- *
- * @param {number} msgCount
- * @param {string} mode
- */
+// ── Idle PS1 ───────────────────────────────────────────────────────────────────
 function printIdlePrompt(msgCount = 0, mode = 'code') {
   const modeLabel = '</> ' + mode;
   const AB = C.cyan;
+
   const l1 = [
     AB + '┌',
     AB + '[' + R + C.coral + ts() + R + AB + ']' + R,
@@ -202,75 +161,110 @@ function printIdlePrompt(msgCount = 0, mode = 'code') {
     AB + '────' + R,
     AB + '[' + R + C.coral + modeLabel + R + AB + ']' + R,
     AB + '────' + R,
-    AB + '[' + R + C.teal  + String(msgCount) + R + AB + ']' + R,
+    AB + '[' + R + C.teal + String(msgCount) + R + AB + ']' + R,
   ].join('');
 
-  const l2 = AB + '└' + '[' + R + C.teal + cwd() + R + AB + ']' + R +
+  const l2 = AB + '└[' + R + C.teal + cwd() + R + AB + ']' + R +
              AB + '──' + R + C.coral + '►' + R + ' ';
 
   process.stdout.write('\n' + l1 + '\n' + l2);
 }
 
-// ── Generic log methods ────────────────────────────────────────────────────────
+// ── WA badge ───────────────────────────────────────────────────────────────────
 const WA_BADGE = C.bold + C.waGreen + '[WA]' + R;
 
+// ── Startup section box ────────────────────────────────────────────────────────
+// Displays the 3-4 WA init messages inside a styled box then closes it.
+let _startupOpen = false;
+
+function openStartupBox(label) {
+  _startupOpen = true;
+  const line = [
+    C.waGreen + '┌' + R,
+    C.waGreen + '[' + R + C.amber + ts() + R + C.waGreen + ']' + R,
+    C.waGreen + '════' + R,
+    C.waGreen + '[' + R + B + C.white + 'whyWhale' + R + C.waGreen + ']' + R,
+    C.waGreen + '════════' + R,
+    C.waGreen + '[' + R + C.waLight + B + (label || 'WA startup') + R + C.waGreen + ']' + R,
+  ].join('');
+  process.stdout.write('\n' + line + '\n');
+}
+
+function startupLine(level, msg) {
+  const color = level === 'success' ? C.waGreen
+              : level === 'warn'    ? C.amber
+              : level === 'error'   ? C.red
+              : C.waLight;
+  const line = [
+    C.waGreen + '┟══ ' + R,
+    C.grey    + ts() + ' ' + R,
+    B + C.waGreen + '[WA] ' + R,
+    color + msg + R,
+  ].join('');
+  process.stdout.write(line + '\n');
+}
+
+function closeStartupBox() {
+  if (!_startupOpen) return;
+  _startupOpen = false;
+  const line = [
+    C.waGreen + '└' + R,
+    C.grey    + '[whatsapp]' + R,
+    C.grey    + '-[startup]' + R,
+    C.grey    + '::' + R,
+    C.grey    + '[' + R,
+    C.waMid   + B + 'startup complete ✅' + R,
+    C.grey    + ']' + R,
+  ].join('');
+  process.stdout.write(line + '\n');
+}
+
+// ── Log object ─────────────────────────────────────────────────────────────────
 const log = {
+
+  // General info — always on its own line, never bleeds into readline prompt
   info(msg) {
-    console.log(`${ts()} ${WA_BADGE} ${C.waLight}${msg}${R}`);
-  },
-  success(msg) {
-    console.log(`${ts()} ${WA_BADGE} ${C.waGreen}${B}${msg}${R}`);
-  },
-  warn(msg) {
-    console.warn(`${ts()} ${WA_BADGE} ${C.amber}${msg}${R}`);
-  },
-  error(msg) {
-    console.error(`${ts()} ${WA_BADGE} ${C.red}${msg}${R}`);
+    safePrint(`${ts()} ${WA_BADGE} ${C.waLight}${msg}${R}`);
   },
 
-  /**
-   * Log an incoming WA message — opens a section if none is active.
-   */
+  success(msg) {
+    safePrint(`${ts()} ${WA_BADGE} ${C.waGreen}${B}${msg}${R}`);
+  },
+
+  warn(msg) {
+    safePrint(`${ts()} ${WA_BADGE} ${C.amber}${msg}${R}`);
+  },
+
+  error(msg) {
+    safePrint(`${ts()} ${WA_BADGE} ${C.red}${msg}${R}`);
+  },
+
+  // WA message log — opens section automatically
   incoming(sender, text) {
     logLine('in', sender, text);
   },
 
-  /**
-   * Log an outgoing WA reply.
-   */
   outgoing(sender, text) {
     logLine('out', sender, text);
   },
 
-  /**
-   * Close the current section with a status tag and optionally reprint
-   * the idle prompt.
-   *
-   * @param {'work'|'chat'|'send'|'end'} status
-   * @param {boolean} printPrompt  — if true, print idle PS1 afterwards
-   * @param {number}  msgCount
-   * @param {string}  mode
-   */
-  closeSection(status = 'chat', printPrompt = false, msgCount = 0, mode = 'code') {
+  // Close section
+  closeSection(status = 'chat') {
     closeSection(status);
-    if (printPrompt) printIdlePrompt(msgCount, mode);
   },
 
-  /**
-   * Manually open a new section (rarely needed — incoming() auto-opens).
-   */
+  // Manual open (rarely needed)
   openSection,
 
-  /**
-   * Print idle prompt directly (called e.g. after terminal work finishes).
-   */
+  // Print idle PS1
   printIdlePrompt,
 
-  /** Whether a section is currently open */
+  openStartupBox,
+  startupLine,
+  closeStartupBox,
+  get startupBoxOpen() { return _startupOpen; },
   get sectionOpen() { return _sectionOpen; },
-
-  /** Current section number */
-  get sectionNum() { return _sectionNum; },
+  get sectionNum()  { return _sectionNum; },
 };
 
 module.exports = { log, colors };

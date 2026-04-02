@@ -122,57 +122,78 @@ async function getAIResponse(userMessage, sender = 'unknown') {
 
 // ─── PHASE 2: executeWork ─────────────────────────────────────────────────────
 // Called by index.js AFTER the section closes, with stdout fully restored.
-// Runs directives visibly in the terminal and returns a summary for WA.
+// Wraps all output in a WA-style section box so readline prompt doesn't bleed in.
 async function executeWork(directives, sender) {
-  const R  = '\x1b[0m';
-  const G  = '\x1b[38;5;35m';
-  const CY = '\x1b[38;5;51m';
-  const AM = '\x1b[38;5;226m';
-  const DM = '\x1b[2m';
-  const WH = '\x1b[38;5;255m\x1b[1m';
-  const RF = '\x1b[38;5;203m';
-  const TL = '\x1b[38;5;43m';
+  const { log, colors: C } = require('./logger');
+  const B  = C.bold;
+  const R  = C.reset;
 
-  const summary = [];
+  const summary      = [];
+  const createdFiles = [];
+
+  // ── Open WA work section box ───────────────────────────────────────────────
+  const ts = () => { const n = new Date(); return [n.getHours(),n.getMinutes(),n.getSeconds()].map(v=>String(v).padStart(2,'0')).join(':'); };
+  process.stdout.write('\n' + [
+    C.waGreen+'┌'+R,
+    C.waGreen+'['+R+C.amber+ts()+R+C.waGreen+']'+R,
+    C.waGreen+'════'+R,
+    C.waGreen+'['+R+B+C.white+'whyWhale'+R+C.waGreen+']'+R,
+    C.waGreen+'════════'+R,
+    C.waGreen+'['+R+C.waLight+B+'⚙ executing work'+R+C.waGreen+']'+R,
+  ].join('') + '\n');
+
+  function wline(icon, label, text, ok) {
+    const col = ok === false ? C.red : ok === true ? C.waGreen : C.waLight;
+    const preview = (text||'').length > 70 ? (text||'').slice(0,70)+'…' : (text||'');
+    process.stdout.write([
+      C.waGreen+'┟══ '+R,
+      C.amber+icon+' '+R,
+      C.grey+label+'  '+R,
+      col+preview+R,
+    ].join('') + '\n');
+  }
 
   // ── Write files ────────────────────────────────────────────────────────────
   for (const f of directives.files) {
-    const abs = path.isAbsolute(f.path)
-      ? f.path
-      : path.join(process.cwd(), f.path);
-
-    process.stdout.write(`  ${CY}📄 writing${R}  ${WH}${f.path}${R} `);
+    const abs = path.isAbsolute(f.path) ? f.path : path.join(process.cwd(), f.path);
     try {
       fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, f.content, 'utf8');
-      process.stdout.write(`${G}✔${R}\n`);
-      summary.push(`📄 wrote \`${f.path}\``);
+      // Strip markdown code fences if model wrapped content
+      let fc = f.content;
+      fc = fc.replace(/^```[\w]*\r?\n/, '').replace(/\r?\n```[\s]*$/, '');
+      fs.writeFileSync(abs, fc, 'utf8');
+      wline('📄', 'wrote', f.path, true);
+      summary.push('📄 wrote `' + f.path + '`');
+      createdFiles.push(abs);
     } catch (e) {
-      process.stdout.write(`${RF}✘ ${e.message}${R}\n`);
-      summary.push(`✘ failed \`${f.path}\`: ${e.message}`);
+      wline('✘', 'failed', f.path + ' — ' + e.message, false);
+      summary.push('✘ failed `' + f.path + '`: ' + e.message);
     }
   }
 
   // ── Run commands ───────────────────────────────────────────────────────────
-  for (const cmd of directives.runs) {
-    process.stdout.write(`  ${AM}⚡ running${R}  ${WH}${cmd}${R}\n`);
+  for (let cmd of directives.runs) {
+    const myPid = process.pid;
+    if (process.platform === 'win32' && /taskkill\b.*\/IM\s+node\.exe/i.test(cmd)) {
+      cmd = `powershell -NoProfile -Command "Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne ${myPid} } | Stop-Process -Force"`;
+    } else if (process.platform !== 'win32' && /\b(killall|pkill)\s+(-\w+\s+)*node\b/i.test(cmd)) {
+      cmd = `pkill -f "node server\\.js" 2>/dev/null; pkill -f "node client\\.js" 2>/dev/null; true`;
+    }
+    wline('⚡', 'run  ', cmd, null);
     const { execSync } = require('child_process');
     try {
-      const out = execSync(cmd, {
-        encoding: 'utf8', timeout: 30_000,
-        cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      const out = execSync(cmd, { encoding: 'utf8', timeout: 30_000, cwd: process.cwd(), stdio: ['pipe','pipe','pipe'] });
       if (out.trim()) {
-        out.trim().split('\n').forEach(l =>
-          process.stdout.write(`  ${DM}│${R}  ${l}\n`)
+        out.trim().split('\n').slice(0,8).forEach(l =>
+          process.stdout.write(C.waGreen+'┟    '+R+C.grey+'│  '+R+C.waLight+l+R+'\n')
         );
       }
-      summary.push(`⚡ ran \`${cmd}\``);
+      summary.push('⚡ ran `' + cmd + '`');
     } catch (e) {
-      const errOut = (e.stderr || e.message || '').trim();
-      if (errOut) process.stdout.write(`  ${RF}${errOut}${R}\n`);
-      process.stdout.write(`  ${RF}exit ${e.status || 1}${R}\n`);
-      summary.push(`✘ \`${cmd}\` failed (exit ${e.status || 1})`);
+      const errOut = (e.stderr || e.message || '').trim().split('\n')[0];
+      if (errOut) wline('✘', 'error', errOut, false);
+      process.stdout.write(C.waGreen+'┟    '+R+C.red+'exit '+((e.status||1))+R+'\n');
+      summary.push('✘ `' + cmd + '` failed (exit ' + (e.status||1) + ')');
     }
   }
 
@@ -183,15 +204,26 @@ async function executeWork(directives, sender) {
     if (!mem.facts) mem.facts = {};
     for (const { key, value } of directives.memory) {
       mem.facts[key] = value;
-      process.stdout.write(`  ${G}💾 memory${R}  ${TL}${key}${R} = ${WH}${value}${R}\n`);
-      summary.push(`💾 remembered \`${key}\``);
+      wline('💾', 'memory', key + ' = ' + value, true);
+      summary.push('💾 remembered `' + key + '`');
     }
     try { saveMemory(mem); } catch (_) {}
     if (_ctx && _ctx.mem) Object.assign(_ctx.mem, mem);
   }
 
-  console.log('');
-  return summary;
+  // ── Close section box ──────────────────────────────────────────────────────
+  const ok = summary.every(s => !s.startsWith('✘'));
+  process.stdout.write([
+    C.waGreen+'└'+R,
+    C.grey+'[whatsapp]'+R,
+    C.grey+'-[work]'+R,
+    C.grey+'::'+R,
+    C.grey+'['+R,
+    (ok ? C.waGreen : C.red)+B+(ok ? 'work done ✅' : 'work done ⚠')+R,
+    C.grey+']'+R,
+  ].join('') + '\n');
+
+  return { summary, createdFiles };
 }
 
 // ─── Integrated call (stdout suppressed) ─────────────────────────────────────
@@ -219,8 +251,7 @@ async function integratedCall(userMessage, sender) {
   let raw = '';
   try {
     await handleAiMessage(userMessage, ctxClone);
-    raw = ctxClone.lastReply ||
-          chunks.join('').replace(/\x1b\[[0-9;]*m/g, '').trim();
+    raw = ctxClone.lastReply || ''; // chunks NOT used — spinner frames would bleed
   } catch (err) {
     process.stdout.write = origWrite;
     return standaloneCall(userMessage, sender);
@@ -257,16 +288,21 @@ async function standaloneCall(userMessage, sender) {
   const messages     = getHistory(sender);
 
   let raw = '';
-  try {
-    switch (provider) {
-      case 'anthropic':   raw = await callAnthropic({ apiKey, model, systemPrompt, messages }); break;
-      case 'openrouter':  raw = await callOpenRouter({ apiKey, model, systemPrompt, messages }); break;
-      case 'groq':        raw = await callGroq({ apiKey, model, systemPrompt, messages }); break;
-      case 'ollama':      raw = await callOllama({ model, systemPrompt, messages }); break;
-      default:            raw = `⚠️ Unknown provider: ${provider}`;
+  // Retry up to 3 times with 2s backoff (handles Ollama cold-start / fetch failed)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (attempt > 1) await new Promise(r => setTimeout(r, 2000));
+      switch (provider) {
+        case 'anthropic':   raw = await callAnthropic({ apiKey, model, systemPrompt, messages }); break;
+        case 'openrouter':  raw = await callOpenRouter({ apiKey, model, systemPrompt, messages }); break;
+        case 'groq':        raw = await callGroq({ apiKey, model, systemPrompt, messages }); break;
+        case 'ollama':      raw = await callOllama({ model, systemPrompt, messages }); break;
+        default:            raw = `⚠️ Unknown provider: ${provider}`;
+      }
+      break; // success — exit retry loop
+    } catch (err) {
+      if (attempt === 3) raw = `⚠️ Provider error (after 3 attempts): ${err.message}`;
     }
-  } catch (err) {
-    raw = `⚠️ Provider error: ${err.message}`;
   }
 
   pushHistory(sender, 'assistant', raw);
