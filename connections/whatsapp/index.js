@@ -42,9 +42,9 @@ const { getAIResponse, executeWork } = require('./aiHandler');
 const { log, colors }                = require('./logger');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const AUTH_DIR         = path.join(os.homedir(), '.whywhale', 'credentials', 'whatsapp');
+const AUTH_DIR         = path.join(os.homedir(), '.whyWhale', 'credentials', 'whatsapp');
 const SESSION_ID       = 'session';
-const CONNECTIONS_PATH = path.join(os.homedir(), '.whywhale_connections.json');
+const CONNECTIONS_PATH = path.join(os.homedir(), '.whyWhale', 'connections.json');
 const MAX_RETRIES      = 3;
 const RETRY_440_MS     = 15_000;
 
@@ -125,6 +125,35 @@ let _retryCount   = 0;
 let _isRunning    = false;
 let _farewellSent = false;
 const _sentByBot  = new Set();
+
+// ─── Message queue ────────────────────────────────────────────────────────────
+// Serialises all incoming WA messages so a long-running AI/agent task
+// never races with a second inbound message (which caused the Boom
+// "Connection Closed" crash when sendPresenceUpdate fired concurrently).
+const _msgQueue = [];
+let   _msgBusy  = false;
+
+function _enqueueMsgTask(fn, sock, sender, queuedText) {
+  _msgQueue.push(fn);
+  // If the queue already had a task running, send a quick acknowledgement
+  // so the user knows their message was received and is waiting its turn.
+  if (_msgBusy && sender && sock && queuedText && !queuedText.startsWith('/') && !queuedText.startsWith('!')) {
+    const pos = _msgQueue.length;
+    const ack  = '⏳ Got it! I\'m finishing a previous task first — your message is queued (#' + pos + ').';
+    sock.sendMessage(sender, { text: ack }).then(s => { if (s?.key?.id) _sentByBot.add(s.key.id); }).catch(() => {});
+  }
+  _drainMsgQueue();
+}
+
+async function _drainMsgQueue() {
+  if (_msgBusy || !_msgQueue.length) return;
+  _msgBusy = true;
+  while (_msgQueue.length) {
+    const task = _msgQueue.shift();
+    try { await task(); } catch (e) { log.error('WA queue task error: ' + e.message); }
+  }
+  _msgBusy = false;
+}
 
 // ─── Farewell ─────────────────────────────────────────────────────────────────
 async function sendFarewellMessage() {
@@ -298,118 +327,118 @@ async function startWhatsApp(opts = {}) {
   });
 
   // ── Incoming messages ─────────────────────────────────────────────────────
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  // Messages are pushed to _msgQueue and processed ONE AT A TIME.
+  // This prevents the Boom "Connection Closed" crash that happened when a
+  // long agent task (Phase 6) was still running while a new WA message
+  // arrived and both called sendPresenceUpdate concurrently on the same socket.
+  sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
-
     for (const msg of messages) {
-      if (!msg.message) continue;
+      // fromMe = true -> bot's own outgoing reply echoed back by Baileys.
+      // Pass null sender/text so _enqueueMsgTask never sends a queue-ack for it.
+      // _processOneMessage still runs and discards it silently via _sentByBot.
+      const fromMe = !!msg.key.fromMe;
+      const sender = fromMe ? null : msg.key?.remoteJid;
+      const text   = fromMe ? null : extractText(msg);
+      _enqueueMsgTask(() => _processOneMessage(msg, sock), sock, sender, text);
+    }
+  });
 
-      const sender     = msg.key.remoteJid;
-      const isSelfChat = !!(_ownerJid && sender === _ownerJid);
+  // ── Queue flush helper — process one message at a time ────────────────────
+  async function _processOneMessage(msg, sock) {
+    if (!msg.message) return;
 
-      if (msg.key.fromMe) {
-        if (_sentByBot.has(msg.key.id)) {
-          _sentByBot.delete(msg.key.id);
-          continue;
+    const sender     = msg.key.remoteJid;
+    const isSelfChat = !!(_ownerJid && sender === _ownerJid);
+
+    if (msg.key.fromMe) {
+      if (_sentByBot.has(msg.key.id)) { _sentByBot.delete(msg.key.id); return; }
+      if (!isSelfChat) return;
+    }
+
+    const text = extractText(msg);
+    if (!text) return;
+
+    // Load dmPolicy config (defaults to 'owner-only' if not set)
+    const { whatsapp: waCfg = {} } = require('../../lib/config').loadConfig();
+    const policy    = waCfg.dmPolicy   || 'owner';
+    const allowFrom = waCfg.allowFrom  || [];
+
+    // 'owner' policy: only the registered owner JID is allowed
+    if (policy === 'owner') {
+      if (_ownerJid && sender !== _ownerJid) {
+        log.info(`Ignored message from non-owner: ${sender}`);
+        return;
+      }
+    } else {
+      const allowed = await dmGuard({ sender, text, policy, allowFrom, sock });
+      if (!allowed) return;
+    }
+
+    // ── PHASE 1: Log incoming, get AI plan (stdout suppressed) ──────────
+    log.incoming(sender, text);
+
+    // Safe presence wrapper — swallows errors if socket is mid-reconnect
+    const safePresence = async (state) => {
+      try { await sock.sendPresenceUpdate(state, sender); } catch (_) {}
+    };
+
+    try {
+      await safePresence('composing');
+
+      // AI plans the response — returns reply text + parsed directives
+      const { reply, directives, workType } = await getAIResponse(text, sender);
+
+      log.outgoing(sender, reply);
+      log.closeSection(workType);
+
+      await safePresence('paused');
+      const sent = await sock.sendMessage(sender, { text: reply }, { quoted: msg });
+      if (sent?.key?.id) _sentByBot.add(sent.key.id);
+
+      // ── PHASE 2: Execute work visibly in the terminal ─────────────────
+      if (workType === 'work' || workType === 'send') {
+        const { summary, createdFiles } = await executeWork(directives, sender);
+
+        if (summary.length > 0) {
+          const doneText = '✅ Done!\n\n' + summary.join('\n');
+          log.openSection();
+          log.outgoing(sender, doneText);
+          log.closeSection('chat');
+          const doneSent = await sock.sendMessage(sender, { text: doneText });
+          if (doneSent?.key?.id) _sentByBot.add(doneSent.key.id);
         }
-        if (!isSelfChat) continue;
+
+        for (const absPath of createdFiles) {
+          try {
+            const fileName   = path.basename(absPath);
+            const fileBuffer = fs.readFileSync(absPath);
+            const ext  = fileName.split('.').pop().toLowerCase();
+            const mime = { pdf:'application/pdf', zip:'application/zip',
+              png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg' }[ext] || 'text/plain';
+            log.info(`Sending file to owner: ${fileName}`);
+            const fileSent = await sock.sendMessage(sender, {
+              document: fileBuffer, fileName, mimetype: mime, caption: `📄 ${fileName}`,
+            });
+            if (fileSent?.key?.id) _sentByBot.add(fileSent.key.id);
+          } catch (ferr) {
+            log.error(`Could not send file ${path.basename(absPath)}: ${ferr.message}`);
+          }
+        }
       }
 
-      const text = extractText(msg);
-      if (!text) continue;
-
-      // Load dmPolicy config (defaults to 'owner-only' if not set)
-      const { whatsapp: waCfg = {} } = require('../../lib/config').loadConfig();
-      const policy    = waCfg.dmPolicy   || 'owner';
-      const allowFrom = waCfg.allowFrom  || [];
-
-      // 'owner' policy: only the registered owner JID is allowed
-      if (policy === 'owner') {
-        if (_ownerJid && sender !== _ownerJid) {
-          log.info(`Ignored message from non-owner: ${sender}`);
-          continue;
-        }
-      } else {
-        // For open / allowlist / pairing — use the full dmGuard logic
-        const allowed = await dmGuard({ sender, text, policy, allowFrom, sock });
-        if (!allowed) continue;
-      }
-
-      // ── PHASE 1: Log incoming, get AI plan (stdout suppressed) ────────
-      log.incoming(sender, text);
-
+    } catch (err) {
+      log.error(`AI handler error: ${err.message}`);
+      if (log.sectionOpen) log.closeSection('end');
       try {
-        await sock.sendPresenceUpdate('composing', sender);
-
-        // AI plans the response — returns reply text + parsed directives
-        const { reply, directives, workType } = await getAIResponse(text, sender);
-
-        // ── Log outgoing reply inside the section ───────────────────────
-        log.outgoing(sender, reply);
-
-        // ── Close section with the right status tag ─────────────────────
-        log.closeSection(workType);
-
-        // ── Send the reply to WhatsApp now ──────────────────────────────
-        await sock.sendPresenceUpdate('paused', sender);
-        const sent = await sock.sendMessage(sender, { text: reply }, { quoted: msg });
-        if (sent?.key?.id) _sentByBot.add(sent.key.id);
-
-        // ── PHASE 2: Execute work visibly in the terminal ───────────────
-        // Only runs when AI produced @@FILE / @@RUN / @@MEMORY directives.
-        // stdout is fully restored here so the user sees the work live.
-        if (workType === 'work' || workType === 'send') {
-          const { summary, createdFiles } = await executeWork(directives, sender);
-
-          // ── Open a new section to report results back via WA ──────────
-          if (summary.length > 0) {
-            const doneText = '✅ Done!\n\n' + summary.join('\n');
-            log.openSection();
-            log.outgoing(sender, doneText);
-            log.closeSection('chat');
-
-            const doneSent = await sock.sendMessage(sender, { text: doneText });
-            if (doneSent?.key?.id) _sentByBot.add(doneSent.key.id);
-          }
-
-          // ── Send each created file as a WA document attachment ────────
-          for (const absPath of createdFiles) {
-            try {
-              const fileName    = path.basename(absPath);
-              const fileBuffer  = fs.readFileSync(absPath);
-              // Pick a readable MIME type for common code files
-              const ext = fileName.split('.').pop().toLowerCase();
-              const mime = {
-                pdf: 'application/pdf',
-                zip: 'application/zip',
-                png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-              }[ext] || 'text/plain';
-
-              log.info(`Sending file to owner: ${fileName}`);
-              const fileSent = await sock.sendMessage(sender, {
-                document: fileBuffer,
-                fileName: fileName,
-                mimetype: mime,
-                caption:  `📄 ${fileName}`,
-              });
-              if (fileSent?.key?.id) _sentByBot.add(fileSent.key.id);
-            } catch (ferr) {
-              log.error(`Could not send file ${path.basename(absPath)}: ${ferr.message}`);
-            }
-          }
-        }
-
-      } catch (err) {
-        log.error(`AI handler error: ${err.message}`);
-        if (log.sectionOpen) log.closeSection('end');
         await sock.sendPresenceUpdate('paused', sender);
         const errSent = await sock.sendMessage(sender, {
           text: '⚠️ Something went wrong. Try again in a moment.',
         });
         if (errSent?.key?.id) _sentByBot.add(errSent.key.id);
-      }
+      } catch (_) {}
     }
-  });
+  }
 
   return sock;
 }

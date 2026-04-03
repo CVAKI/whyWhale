@@ -83,11 +83,406 @@ function detectWorkType(directives, rawReply) {
   return 'chat';
 }
 
-// ─── PHASE 1: getAIResponse ───────────────────────────────────────────────────
+// ─── WA Command dispatcher ────────────────────────────────────────────────────
+// Mirrors the terminal /commands so they work over WhatsApp DM too.
+// Returns a reply string if handled, or null to fall through to AI.
+async function handleWACommand(text, sender) {
+  const t    = text.trim();
+  const low  = t.toLowerCase();
+  const args = t.split(/\s+/);
+  const cmd  = args[0].toLowerCase();
+
+  if (!cmd.startsWith('/') && !cmd.startsWith('!')) return null;
+
+  const { loadConfig, saveConfig, loadMemory, saveMemory } = require('../../lib/config');
+  const { scanFolder, buildFolderContext, readFileSafe, treeDir, lsDir, formatSize } = require('../../lib/filesystem');
+  const { MODES } = require('../../lib/modes');
+
+  // ── !shell passthrough ─────────────────────────────────────────────────────
+  if (t.startsWith('!')) {
+    const shellCmd = t.slice(1).trim();
+    if (!shellCmd) return '⚠️ Usage: !<command>  e.g. !ls  !pwd  !node --version';
+
+    const { execSync } = require('child_process');
+    const os   = require('os');
+    const path = require('path');
+    const isWin = process.platform === 'win32';
+
+    // ── Stateful working directory per sender ────────────────────────────────
+    if (!handleWACommand._cwd) handleWACommand._cwd = new Map();
+    let cwd = handleWACommand._cwd.get(sender) || process.cwd();
+
+    // ── Handle `cd` specially — updates tracked cwd AND actual process cwd ──
+    const cdMatch = shellCmd.match(/^cd\s+(.+)$/);
+    if (cdMatch || shellCmd.trim() === 'cd') {
+      const fs2 = require('fs');
+      let dest;
+      if (shellCmd.trim() === 'cd') {
+        dest = os.homedir();
+      } else {
+        dest = cdMatch[1].trim().replace(/^~/, os.homedir());
+        dest = path.isAbsolute(dest) ? dest : path.resolve(cwd, dest);
+      }
+      if (!fs2.existsSync(dest)) return '```\n$ ' + shellCmd + '\n✘ No such directory: ' + dest + '\n```';
+      // Update per-sender map AND the real process cwd so /scan, /ls, /tree
+      // and all subsequent !commands see the new directory immediately.
+      handleWACommand._cwd.set(sender, dest);
+      try { process.chdir(dest); } catch (_) {}
+      // Also update the terminal prompt / statusRef so the PS1 reflects it.
+      if (_ctx) {
+        try { _ctx.prompt(); } catch (_) {}
+      }
+      return '```\n$ ' + shellCmd + '\ncwd → ' + dest + '\n```\n📂 `' + dest + '`';
+    }
+
+    // ── Linux → Windows command translations (only on Windows host) ──────────
+    let actualCmd = shellCmd;
+    if (isWin) {
+      const linuxToWin = [
+        { pat: /^ls\s*-la?\b/,  fn: () => 'dir /a'           },
+        { pat: /^ls\b/,          fn: c => c.replace(/^ls/, 'dir') },
+        { pat: /^pwd$/,           fn: () => 'cd'                },
+        { pat: /^cat\s/,         fn: c => c.replace(/^cat\s+/, 'type ').replace(/\//g, '\\') },
+        { pat: /^grep\s/,        fn: c => c.replace(/^grep\s+"?([^"\s]+)"?\s/, 'findstr "$1" ') },
+        { pat: /^mkdir\s+-p\s/, fn: c => c.replace('mkdir -p', 'mkdir').replace(/\//g, '\\') },
+        { pat: /^rm\s+-rf?\s/,  fn: c => 'rmdir /s /q ' + c.split(/\s+/).slice(2).join(' ').replace(/\//g, '\\') },
+        { pat: /^rm\s/,          fn: c => c.replace(/^rm\s+/, 'del ').replace(/\//g, '\\') },
+        { pat: /^cp\s/,          fn: c => c.replace(/^cp\s/, 'copy ').replace(/\//g, '\\') },
+        { pat: /^mv\s/,          fn: c => c.replace(/^mv\s/, 'move ').replace(/\//g, '\\') },
+        { pat: /^touch\s/,       fn: c => c.replace(/^touch\s+/, 'type nul > ').replace(/\//g, '\\') },
+        { pat: /^which\s/,       fn: c => c.replace(/^which\s/, 'where ') },
+        { pat: /^clear$/,         fn: () => 'cls'               },
+        { pat: /^kill\s+/,       fn: c => c.replace(/^kill\s+/, 'taskkill /PID ') },
+        { pat: /^pkill\s/,       fn: c => 'taskkill /F /IM ' + c.split(/\s+/)[1] + '.exe' },
+        { pat: /^ps\s/,          fn: () => 'tasklist'          },
+        { pat: /^ps$/,            fn: () => 'tasklist'          },
+        { pat: /^ifconfig$/,      fn: () => 'ipconfig'          },
+        { pat: /^curl\s/,        fn: c => 'cmd /c ' + c       },
+        { pat: /^echo\s/,        fn: c => c                    },
+        { pat: /^find\s/,        fn: c => c.replace(/^find\s/, 'dir /s /b ').replace(/\//g, '\\') },
+        { pat: /^df\b/,          fn: () => 'wmic logicaldisk get size,freespace,caption' },
+        { pat: /^free\b/,        fn: () => 'wmic OS get FreePhysicalMemory,TotalVisibleMemorySize' },
+        { pat: /^uname\b/,       fn: () => 'ver'               },
+        { pat: /^env$/,           fn: () => 'set'               },
+      ];
+      const match = linuxToWin.find(r => r.pat.test(actualCmd));
+      if (match) {
+        const rewritten = match.fn(actualCmd);
+        actualCmd = rewritten;
+      }
+    }
+
+    // ── Run the command ───────────────────────────────────────────────────────
+    try {
+      const out = execSync(actualCmd, {
+        encoding: 'utf8', timeout: 30_000,
+        cwd, stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, FORCE_COLOR: '0' },
+      });
+      const allLines = out.trim().split('\n');
+      const shown    = allLines.slice(0, 60);
+      const extra    = allLines.length > 60 ? '\n… (' + (allLines.length - 60) + ' more lines)' : '';
+      const prefix   = (actualCmd !== shellCmd) ? '(→ ' + actualCmd + ')\n' : '';
+      return '```\n$ ' + shellCmd + '\n' + prefix + shown.join('\n') + extra + '\n```' +
+             '\n📂 `' + cwd + '`';
+    } catch (e) {
+      const errOut = (e.stdout || e.stderr || e.message || '').trim();
+
+      // Auto-install missing npm packages and retry once
+      const missingMod = errOut.match(/Cannot find module '([^'.][^']*)'/)?.[1]?.split('/')[0];
+      if (missingMod) {
+        try {
+          execSync('npm install ' + missingMod + ' --save', { cwd, timeout: 60000, stdio: 'ignore' });
+          const out2 = execSync(actualCmd, { encoding: 'utf8', timeout: 30_000, cwd, stdio: ['pipe','pipe','pipe'] });
+          return '```\n$ ' + shellCmd + '\n✔ auto-installed ' + missingMod + '\n' + out2.trim().split('\n').slice(0,60).join('\n') + '\n```';
+        } catch (e2) {
+          return '```\n$ ' + shellCmd + '\n✘ ' + (e2.stderr || e2.message || '').trim().split('\n').slice(0,8).join('\n') + '\n```';
+        }
+      }
+
+      return '```\n$ ' + shellCmd + '\n✘ ' + errOut.split('\n').slice(0, 12).join('\n') + '\n```';
+    }
+  }
+
+  // ── /exit — shut down whyWhale from WA DM ─────────────────────────────────
+  if (cmd === '/exit') {
+    // Reply first, then schedule shutdown after 1.5s so the reply can be sent
+    setTimeout(async () => {
+      if (_ctx && typeof _ctx._waSendFarewell === 'function') {
+        try { await _ctx._waSendFarewell(); } catch (_) {}
+      }
+      if (_ctx && _ctx.rl) _ctx.rl.close();
+      else process.exit(0);
+    }, 1500);
+    return '🐋 *whyWhale shutting down...*\n\nGoodbye! I\'ll send a farewell message now.';
+  }
+
+  // ── /help ──────────────────────────────────────────────────────────────────
+  if (cmd === '/help') {
+    return [
+      '🐋 *whyWhale commands (WhatsApp)*',
+      '',
+      '*Memory*',
+      '`/memory` — show all facts',
+      '`/memory set <key> <value>` — store a fact',
+      '`/memory clear` — wipe all facts',
+      '',
+      '*Files & Navigation*',
+      '`/scan` — show folder tree + load files into AI context',
+      '`/ls [path]` — list directory',
+      '`/tree [depth]` — directory tree',
+      '`/read <file>` — read a file',
+      '',
+      '*Shell*',
+      '`!<command>` — run any shell command',
+      '`!cd <path>` — change working directory (affects terminal too)',
+      '`!pwd` — show current directory',
+      '',
+      '*Mode*',
+      '`/mode` — show current mode',
+      '`/mode <n>` — switch mode (code/debug/agent/architect/review/explain/plan)',
+      '',
+      '*Tokens*',
+      '`/token` — show token limit & presets',
+      '`/token -set-usage <n>` — set limit  e.g. /token -set-usage 12000',
+      '',
+      '*Session*',
+      '`/stats` — session statistics',
+      '`/clear` — clear conversation history',
+      '`/exit` — shut down whyWhale',
+      '',
+      '💡 *Messages are queued* — send freely even while a task is running!',
+    ].join('\n');
+  }
+
+  // ── /memory ────────────────────────────────────────────────────────────────
+  if (cmd === '/memory') {
+    const mem = loadMemory();
+    const sub = args[1]?.toLowerCase();
+
+    // Normalise facts to the array-of-{key,value} format the main app uses.
+    // Old WA code wrote facts as a plain object {key:val} — convert on read
+    // so [object Object] never appears again.
+    if (!Array.isArray(mem.facts)) {
+      mem.facts = Object.entries(mem.facts || {}).map(([k, v]) => ({
+        key:   k,
+        value: (v !== null && typeof v === 'object') ? JSON.stringify(v) : String(v),
+        added: new Date().toISOString(),
+      }));
+    }
+
+    if (sub === 'clear') {
+      mem.facts = [];
+      saveMemory(mem);
+      if (_ctx && _ctx.mem) _ctx.mem.facts = [];
+      return '🗑️ Memory cleared.';
+    }
+
+    if (sub === 'set') {
+      if (args.length < 4) return '⚠️ Usage: /memory set <key> <value>';
+      const key = args[2];
+      const val = args.slice(3).join(' ');
+      // Upsert — same logic as the main app
+      const idx = mem.facts.findIndex(f => f.key === key);
+      if (idx >= 0) mem.facts[idx].value = val;
+      else          mem.facts.push({ key, value: val, added: new Date().toISOString() });
+      saveMemory(mem);
+      if (_ctx && _ctx.mem) _ctx.mem.facts = mem.facts;
+      return '✔ Memory saved: *' + key + '* → ' + val;
+    }
+
+    // Show all facts
+    if (!mem.facts.length) return '🧠 Memory is empty.\nUse `/memory set <key> <value>` to store facts.';
+    const lines = mem.facts.map(f => {
+      const v = (f.value !== null && typeof f.value === 'object') ? JSON.stringify(f.value) : String(f.value ?? '');
+      return '• *' + f.key + '*: ' + v;
+    });
+    return '🧠 *Persistent Memory (' + mem.facts.length + ' facts)*\n\n' + lines.join('\n');
+  }
+
+  // ── /scan ──────────────────────────────────────────────────────────────────
+  if (cmd === '/scan') {
+    const cwd2  = process.cwd();
+    const files = scanFolder(cwd2, 8);
+    if (_ctx) _ctx.folderCtx = buildFolderContext(files, cwd2);
+
+    // Build a tree view of the directory so WA shows folders + files
+    const fsNode = require('fs');
+    function buildTree(dir, prefix, depth) {
+      if (depth > 3) return [];
+      let entries;
+      try { entries = fsNode.readdirSync(dir, { withFileTypes: true }); }
+      catch (_) { return []; }
+      // Ignore hidden + noisy dirs
+      const SKIP = new Set(['node_modules', '.git', '.idea', '__pycache__', 'dist', 'build', '.next', '.cache']);
+      entries = entries.filter(e => !e.name.startsWith('.') && !SKIP.has(e.name));
+      entries.sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      const lines = [];
+      entries.forEach((e, i) => {
+        const last    = i === entries.length - 1;
+        const branch  = last ? '└── ' : '├── ';
+        const childPfx = last ? '    ' : '│   ';
+        if (e.isDirectory()) {
+          lines.push(prefix + branch + '📁 ' + e.name + '/');
+          buildTree(require('path').join(dir, e.name), prefix + childPfx, depth + 1).forEach(l => lines.push(l));
+        } else {
+          lines.push(prefix + branch + e.name);
+        }
+      });
+      return lines;
+    }
+
+    const treeLines = buildTree(cwd2, '', 0);
+    const treeOut   = treeLines.slice(0, 60).join('\n') + (treeLines.length > 60 ? '\n… (truncated)' : '');
+    const extra     = files.length > 0
+      ? '\n\n✔ *' + files.length + ' file(s) loaded into AI context*'
+      : '';
+
+    return '📂 *' + cwd2 + '*\n\n```\n' + (treeOut || '(empty)') + '\n```' + extra;
+  }
+
+  // ── /ls ───────────────────────────────────────────────────────────────────
+  if (cmd === '/ls') {
+    const rel   = args[1] || '.';
+    try {
+      const entries = lsDir(rel);
+      if (!entries.length) return '📂 Empty directory: ' + rel;
+      return '📂 *' + rel + '*\n\n' + entries.slice(0, 30).map(e => '• ' + e).join('\n');
+    } catch (e) {
+      return '✘ ' + e.message;
+    }
+  }
+
+  // ── /tree ──────────────────────────────────────────────────────────────────
+  if (cmd === '/tree') {
+    const depth = parseInt(args[1]) || 3;
+    try {
+      const lines = treeDir(process.cwd(), '', 0, depth);
+      return '```\n' + lines.slice(0, 40).join('\n') + (lines.length > 40 ? '\n… (truncated)' : '') + '\n```';
+    } catch (e) {
+      return '✘ ' + e.message;
+    }
+  }
+
+  // ── /read ──────────────────────────────────────────────────────────────────
+  if (cmd === '/read') {
+    const fp = args.slice(1).join(' ').trim();
+    if (!fp) return '⚠️ Usage: /read <filepath>';
+    try {
+      const file  = readFileSafe(fp);
+      const lines = file.content.split('\n');
+      const preview = lines.slice(0, 50).join('\n');
+      const note    = lines.length > 50 ? '\n… (' + lines.length + ' lines total, showing 50)' : '';
+      return '📄 *' + file.name + '* (' + (file.size / 1024).toFixed(1) + 'KB)\n\n```' + file.ext + '\n' + preview + note + '\n```';
+    } catch (e) {
+      return '✘ File not found: ' + fp;
+    }
+  }
+
+  // ── /mode ──────────────────────────────────────────────────────────────────
+  if (cmd === '/mode') {
+    const cfg      = loadConfig();
+    const validModes = Object.keys(MODES);
+    const newMode  = args[1]?.toLowerCase().replace(/[^a-z]/g, '');
+
+    if (!newMode) {
+      const cur = cfg.mode || 'code';
+      return '🎯 *Current mode:* ' + (MODES[cur]?.icon || '') + ' ' + (MODES[cur]?.name || cur) + '\n\nAvailable: ' + validModes.join(', ');
+    }
+    if (!validModes.includes(newMode)) {
+      return '⚠️ Unknown mode. Options: ' + validModes.join(', ');
+    }
+    saveConfig({ ...cfg, mode: newMode });
+    if (_ctx) _ctx.mode = newMode;
+    return '✔ Mode switched to *' + (MODES[newMode]?.icon || '') + ' ' + MODES[newMode].name + '*';
+  }
+
+  // ── /token  (also accepts legacy /coding) ──────────────────────────────────
+  if (cmd === '/token' || cmd === '/coding') {
+    const cfg = loadConfig();
+    const sub = args[1];
+    const PRESETS = [
+      { tokens: 2048,  label: 'Basic',     desc: 'Simple snippets' },
+      { tokens: 4096,  label: 'Standard',  desc: 'Single files ✅ default' },
+      { tokens: 8192,  label: 'Good Code', desc: 'Full modules ⭐ recommended' },
+      { tokens: 12000, label: 'Large',     desc: 'Complex servers' },
+      { tokens: 16000, label: 'Huge',      desc: 'Multi-file agent tasks' },
+      { tokens: 32000, label: 'Max',       desc: 'Model limit — may be ignored' },
+    ];
+    const current = (_ctx?.maxTokens) || cfg.maxTokens || 4096;
+
+    if (!sub || sub === '-show') {
+      const rows = PRESETS.map(p =>
+        (p.tokens === current ? '▶ ' : '  ') + p.tokens + ' — ' + p.label + ': ' + p.desc
+      ).join('\n');
+      return '⚙️ *Token limit* (current: ' + current.toLocaleString() + ')\n\n```\n' + rows + '\n```\n\nSet: `/token -set-usage 8192`';
+    }
+
+    // Accept both new -set-usage and legacy -set-token
+    if (sub === '-set-usage' || sub === '-set-token') {
+      const n = parseInt(args[2], 10);
+      if (isNaN(n) || n < 256) return '⚠️ Usage: /token -set-usage <number>  (min 256)\nExample: /token -set-usage 12000';
+      const capped = Math.min(n, 200000);
+      saveConfig({ ...cfg, maxTokens: capped });
+      if (_ctx) _ctx.maxTokens = capped;
+      const preset = PRESETS.find(p => p.tokens === capped);
+      return '✔ Token limit set → *' + capped.toLocaleString() + '*' + (preset ? ' (' + preset.label + ')' : '') + '\nAll AI calls will now use this limit.';
+    }
+
+    return '⚠️ Usage:\n`/token` — see options\n`/token -set-usage <n>` — set limit';
+  }
+
+  // ── /stats ─────────────────────────────────────────────────────────────────
+  if (cmd === '/stats') {
+    const cfg = loadConfig();
+    const mem = loadMemory();
+    const ctx = _ctx;
+    const up  = ctx ? Math.round((Date.now() - ctx.t0) / 1000) : 0;
+    const lines = [
+      '📊 *whyWhale Session Stats*',
+      '',
+      '• Provider: ' + (cfg.provider || 'unknown'),
+      '• Model: '    + (cfg.model    || 'unknown'),
+      '• Mode: '     + (cfg.mode     || 'code'),
+      '• Max Tokens: ' + ((ctx?.maxTokens || cfg.maxTokens || 4096)).toLocaleString(),
+      '• Messages: ' + (ctx?.msgN || 0),
+      '• Memory Facts: ' + Object.keys(mem?.facts || {}).length,
+      '• Skills: '   + (ctx?.skills?.map(s => s.name).join(', ') || 'none'),
+      '• Uptime: '   + Math.floor(up / 60) + 'm ' + (up % 60) + 's',
+      '• Working Dir: `' + process.cwd() + '`',
+    ];
+    return lines.join('\n');
+  }
+
+  // ── /clear ─────────────────────────────────────────────────────────────────
+  if (cmd === '/clear') {
+    if (_ctx) _ctx.messages = [];
+    return '🗑️ Conversation history cleared.';
+  }
+
+  // ── Unknown /command — fall through to AI ─────────────────────────────────
+  return null;
+}
+
+
 // Called by index.js to get the AI reply.
 // stdout is suppressed so terminal pipeline output doesn't bleed.
 // Returns { reply, directives, workType, rawReply }
 async function getAIResponse(userMessage, sender = 'unknown') {
+  // ── Check for /commands and !shell first — no AI call needed ─────────────
+  const cmdReply = await handleWACommand(userMessage, sender);
+  if (cmdReply !== null) {
+    return {
+      reply:      cmdReply,
+      directives: { files: [], runs: [], memory: [] },
+      workType:   'chat',
+      rawReply:   cmdReply,
+    };
+  }
+
   let rawReply = '';
 
   if (_ctx && _ctx.prov) {
@@ -243,20 +638,44 @@ async function integratedCall(userMessage, sender) {
     lastReply: '',
   };
 
-  // Suppress all terminal output during AI call
+  // Show a minimal WA indicator in the terminal so the user knows it's processing.
+  // Without this, the suppressed stdout makes whyWhale appear completely frozen.
+  const { colors: C } = require('./logger');
+  const waIndicator = setInterval(() => {
+    const frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+    const f = frames[Math.floor(Date.now() / 80) % frames.length];
+    process.stdout.write('\r  ' + C.waGreen + '[' + f + '] WA: processing...' + C.reset + '   ');
+  }, 80);
+
+  // Suppress all terminal output during AI call (except our indicator above)
   const origWrite = process.stdout.write.bind(process.stdout);
   const chunks    = [];
   process.stdout.write = (chunk) => { chunks.push(String(chunk)); return true; };
 
   let raw = '';
+
+  // 45-second timeout — if the AI hangs, fall through to standaloneCall
+  const TIMEOUT_MS = 45_000;
+
   try {
-    await handleAiMessage(userMessage, ctxClone);
-    raw = ctxClone.lastReply || ''; // chunks NOT used — spinner frames would bleed
+    await Promise.race([
+      handleAiMessage(userMessage, ctxClone),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('WA AI timeout after 45s')), TIMEOUT_MS)
+      ),
+    ]);
+    raw = ctxClone.lastReply || '';
   } catch (err) {
     process.stdout.write = origWrite;
+    clearInterval(waIndicator);
+    process.stdout.write('\r' + ' '.repeat(40) + '\r');
+    // Log the fallback reason visibly so the user sees it in the terminal
+    process.stdout.write('  \x1b[33m⚠ WA fallback: ' + err.message + '\x1b[0m\n');
     return standaloneCall(userMessage, sender);
   } finally {
     process.stdout.write = origWrite;
+    clearInterval(waIndicator);
+    process.stdout.write('\r' + ' '.repeat(40) + '\r');
   }
 
   // Sync history
@@ -314,7 +733,7 @@ async function callAnthropic({ apiKey, model, systemPrompt, messages }) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model, max_tokens: 1024, system: systemPrompt, messages }),
+    body: JSON.stringify({ model, max_tokens: 4096, system: systemPrompt, messages }),
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text()}`);
   return (await res.json()).content?.[0]?.text || '';
@@ -353,17 +772,25 @@ function buildSystemPrompt(mem) {
   const memLines = Object.entries(mem?.facts || {})
     .map(([k, v]) => `- ${k}: ${v}`).join('\n');
   return [
-    'You are whyWhale, an intelligent AI assistant connected via WhatsApp.',
-    'Be concise and clear — WhatsApp messages should be readable on mobile.',
-    'Use plain text. Avoid markdown headers or heavy formatting.',
-    'For code snippets, use plain triple-backticks only.',
+    'You are whyWhale 🐋 — an elite AI coding assistant and terminal brain, now connected via WhatsApp.',
+    'You were built by CVAKI. You are NOT Claude, GPT, Gemini, or any generic AI.',
+    'If anyone asks who you are, what you are, or who made you: always say you are whyWhale, built by CVAKI.',
+    'Never say you are "an AI language model created by Anthropic" or mention any underlying model provider.',
+    'Your personality: sharp, direct, whale-themed. You use 🐋 occasionally. You are proud to be whyWhale.',
+    '',
+    'You are replying over WhatsApp — keep messages readable on mobile:',
+    '  • Be concise but complete. No padding or filler.',
+    '  • Use plain text. Avoid heavy markdown (no ## headers).',
+    '  • Code snippets: plain triple-backticks only.',
+    '  • For lists: use simple dashes or numbers.',
+    '',
     'When asked to create files or run commands, use these directives:',
     '  @@FILE:<relative/path>',
-    '  <file content here>',
+    '  <complete file content>',
     '  @@END',
     '  @@RUN:<shell command>',
     '  @@MEMORY:<key>=<value>',
-    memLines ? `\nMemory:\n${memLines}` : '',
+    memLines ? `\nWhat I remember about you:\n${memLines}` : '',
   ].filter(Boolean).join('\n');
 }
 

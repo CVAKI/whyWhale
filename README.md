@@ -3,269 +3,315 @@
 </p>
 
 <p align="center">
-  <img src="https://readme-typing-svg.demolab.com?font=Courier+New&size=15&duration=2800&pause=600&color=1EB4FF&center=true&vCenter=true&repeat=true&width=700&height=36&lines=AI+Terminal+%C2%B7+Self-Testing+Code+Engine;Persistent+Memory+%C2%B7+Skills+System;7-Phase+Neural+Pipeline+Architecture;Multi-Provider%3A+Claude+%C2%B7+Groq+%C2%B7+Ollama+%C2%B7+OpenRouter" alt="Typing SVG"/>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/version-4.0.0-1EB4FF?style=for-the-badge&labelColor=030a12" alt="version"/>
+  <img src="https://img.shields.io/badge/version-alpha_1-FF6B2B?style=for-the-badge&labelColor=030a12" alt="version"/>
   <img src="https://img.shields.io/badge/Node.js-18+-3CDCC8?style=for-the-badge&logo=node.js&logoColor=white&labelColor=030a12" alt="node"/>
   <img src="https://img.shields.io/badge/license-MIT-B96EFF?style=for-the-badge&labelColor=030a12" alt="license"/>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-FFC83C?style=for-the-badge&labelColor=030a12" alt="platform"/>
-  <img src="https://img.shields.io/badge/AI-Claude%20%7C%20Groq%20%7C%20Ollama-FF6B2B?style=for-the-badge&labelColor=030a12" alt="ai"/>
+  <img src="https://img.shields.io/badge/AI-Claude%20%7C%20Groq%20%7C%20Ollama-1EB4FF?style=for-the-badge&labelColor=030a12" alt="ai"/>
 </p>
-
-<br/>
 
 <p align="center">
   <img src="https://capsule-render.vercel.app/api?type=rect&color=0:030a12,100:041525&height=2&section=header" width="100%"/>
 </p>
 
-## ✨ What's New in v4
+<br/>
 
-| Feature | Description |
-|---|---|
-| 🧠 **7-Phase AI Brain** | Tokenization → Context → Transformer → Thinking → Code Gen → Tool Use → Response |
-| 🔬 **Self-Testing Loop** | Writes code → runs it → reads errors → auto-fixes (up to 3 rounds) |
-| 💾 **Persistent Memory** | Remembers facts, projects, and session history across restarts |
-| 📂 **Folder Scanner** | Auto-reads your project files into AI context on startup |
-| 🎯 **Skills System** | Download and install prompt skill packs |
-| 🖥️ **Shell Passthrough** | Run any terminal command with `!command` |
-| 🎨 **Whale PS1 Prompt** | Parrot-OS style prompt — whale-branded |
-| 🌈 **Syntax Highlighting** | 12+ languages with full token coloring |
-| 🤖 **Multi-Provider** | Anthropic Claude, OpenRouter, Groq, Ollama |
+> 🐋 **whyWhale** is an AI assistant that lives in your terminal. Type naturally, run shell commands, manage files, and let the AI write and fix code — all without leaving your terminal.
 
 <br/>
 
-## 🚀 Installation
+## 📦 Installation
 
-**Option 1 — Global install (recommended)**
+**Step 1 — Clone and install**
 ```bash
 git clone https://github.com/CVAKI/whyWhale.git
 cd whyWhale
 npm install -g .
+```
+
+**Step 2 — Launch**
+```bash
 whywhale
-```
-
-**Option 2 — Run directly**
-```bash
-node bin/whywhale.js
-```
-
-**Option 3 — Short alias**
-```bash
+# or the short alias:
 ww
 ```
+
+**First launch** will walk you through a quick setup — pick your AI provider, paste your API key, and you're in.
+
+> 💡 To run without installing globally: `node bin/whywhale.js`
 
 <br/>
 
 ## ⚙️ First-Time Setup
 
-On first launch, whyWhale will prompt you to configure:
+When you launch whyWhale for the first time, it will ask you:
 
-1. **AI Provider** — Anthropic / OpenRouter / Groq / Ollama
-2. **Model** — e.g. `claude-sonnet-4-20250514`
-3. **API Key** — saved to `~/.whywhale.json`
+1. **Choose a provider** — Anthropic, OpenRouter, Groq, or Ollama (local/free)
+2. **Pick a model** — a numbered list is shown for your chosen provider
+3. **Paste your API key** — stored locally at `~/.whyWhale/config.json`
 
-Or run setup manually:
+To redo setup at any time:
 ```bash
 whywhale --setup
 ```
 
-<br/>
-
-## 🎮 Commands Reference
-
-### Chat & Modes
-
-| Command | Action |
-|---|---|
-| `(type anything)` | Chat with the AI |
-| `/mode code` | Switch to code mode `</>` |
-| `/mode architect` | System design mode `⬡` |
-| `/mode debug` | Debugging mode `⚡` |
-| `/mode explain` | Teaching mode `❋` |
-| `/mode review` | Code review mode `⊕` |
-| `/mode plan` | Project planning mode `📋` |
-| `/mode agent` | Autonomous agent mode `◈` |
-
-### Shell Passthrough
+To reset everything and start fresh:
 ```bash
-!ls -la          # list files
-!git status      # git commands
-!python app.py   # run scripts
-!npm install     # package management
-```
-
-### Memory System
-
-| Command | Action |
-|---|---|
-| `/memory` | Show all stored memories |
-| `/memory set key value` | Store a fact manually |
-| `/memory clear` | Wipe all memories |
-
-The AI also auto-saves with `@@MEMORY: key: value` blocks in its responses.
-
-### Skills
-
-| Command | Action |
-|---|---|
-| `/skill list` | Show available + installed skills |
-| `/skill install react` | Install the React skill |
-| `/skill show react` | Preview skill prompt |
-| `/skill remove react` | Uninstall a skill |
-
-**Built-in skill registry:**
-`react` · `python` · `security` · `testing` · `api-design` · `docker` · `database` · `git` · `performance` · `typescript`
-
-### File Commands
-
-| Command | Action |
-|---|---|
-| `/ls [path]` | List files in directory |
-| `/tree [depth]` | Directory tree (default depth 3) |
-| `/read <path>` | Read file with syntax highlighting |
-| `/analyse <path>` | Deep AI analysis of a file |
-| `/write <path>` | AI-generate content for a file |
-| `/scan` | Re-scan current directory into context |
-
-### Session
-
-| Command | Action |
-|---|---|
-| `/save [name]` | Save conversation to `~/.whywhale_sessions/` |
-| `/load` | Restore a saved session |
-| `/export` | Export chat as styled HTML |
-| `/dashboard` | Open web dashboard at `http://localhost:7070` |
-| `/history` | Show session history |
-| `/stats` | Session statistics |
-| `/exit` | Quit (saves session summary to memory) |
-
-<br/>
-
-## 🌊 Providers
-
-<table>
-<tr>
-<td>
-
-### 🔵 Anthropic (Claude)
-```
-Provider: anthropic
-Model:    claude-sonnet-4-20250514
-          claude-opus-4-20250514
-          claude-haiku-4-5-20251001
-API Key:  sk-ant-...
-```
-[Get key →](https://console.anthropic.com)
-
-</td>
-<td>
-
-### 🟠 OpenRouter
-```
-Provider: openrouter
-Model:    anthropic/claude-3.5-sonnet
-          (any OpenRouter model)
-API Key:  sk-or-...
-```
-[Get key →](https://openrouter.ai)
-
-</td>
-</tr>
-<tr>
-<td>
-
-### 🔴 Groq
-```
-Provider: groq
-Model:    llama-3.3-70b-versatile
-API Key:  gsk_...
-```
-[Get key →](https://console.groq.com)
-
-</td>
-<td>
-
-### 🟢 Ollama (Local)
-```
-Provider: ollama
-Model:    llama3.2  (or any local model)
-API Key:  (leave blank)
-```
-[Install →](https://ollama.com)
-
-</td>
-</tr>
-</table>
-
-<br/>
-
-## 🧠 Architecture
-
-whyWhale's AI pipeline mirrors real LLM architecture:
-
-```
-Your message
-    ↓
-Phase 1 — Tokenization        (intent parsing)
-    ↓
-Phase 2 — Context Assembly    (system + memory + skills + files + history)
-    ↓
-Phase 3 — Transformer         (API call)
-    ↓
-Phase 4 — Extended Thinking   (reasoning in system prompt)
-    ↓
-Phase 5 — Code Generation     (autoregressive decoding)
-    ↓
-Phase 6 — Self-Testing Loop   (run → error → fix × 3)
-    ↓
-Phase 7 — Response Assembly   (memory update + output)
-    ↓
-Streamed output to your terminal
+whywhale --reset
+# or from inside the app:
+/reset
 ```
 
 <br/>
 
-## 🎨 PS1 Prompt
+## 🌊 Choosing a Provider
 
-```
-┌[11:19:07]────[whyWhale]────[💻 code]────[#7]
-└[~/projects]──►
-```
+| Provider | Best For | API Key |
+|---|---|---|
+| **Anthropic** | Best quality, Claude models | [console.anthropic.com](https://console.anthropic.com) |
+| **OpenRouter** | Access many models with one key | [openrouter.ai](https://openrouter.ai) |
+| **Groq** | Very fast responses, free tier | [console.groq.com](https://console.groq.com) |
+| **Ollama** | 100% local, no API key needed | [ollama.com](https://ollama.com) |
 
-| Field | Description |
-|---|---|
-| **Timestamp** | Current time |
-| **Brand** | whyWhale (ocean blue) |
-| **Mode** | Current AI mode with icon |
-| **Counter** | Message count this session |
-| **Directory** | Current working directory |
+To switch provider later, type `/provider` inside the app.
 
 <br/>
 
-## 💾 Data Files
+## 💬 Chatting with the AI
 
-| Path | Contents |
-|---|---|
-| `~/.whywhale.json` | Config (provider, model, API key, settings) |
-| `~/.whywhale_memory.json` | Persistent memory (facts, projects, sessions) |
-| `~/.whywhale_sessions/` | Per-session chat history |
-| `~/.whywhale_skills/` | Installed skill JSON files |
+Just type anything and press Enter — the AI will respond.
+
+```
+┌[11:19:07]────[whyWhale]────[💻 code]────[#3]
+└[~/my-project]──► explain what a closure is in JavaScript
+```
+
+The prompt shows your current **time**, **mode**, **message count**, and **working directory**.
+
+### Switching AI Modes
+
+Modes change how the AI thinks and responds. Switch with `/mode <name>`:
+
+| Command | Mode | Good For |
+|---|---|---|
+| `/mode code` | 💻 Code | Writing and editing code |
+| `/mode architect` | ⬡ Architect | Designing systems and structure |
+| `/mode debug` | ⚡ Debug | Finding and fixing bugs |
+| `/mode explain` | ❋ Explain | Learning something new |
+| `/mode review` | ⊕ Review | Getting feedback on your code |
+| `/mode plan` | 📋 Plan | Breaking down a project |
+| `/mode agent` | ◈ Agent | Let AI create and fix files on its own |
+
+> 💡 whyWhale will also **auto-switch modes** based on what you type — e.g. if you say "fix this bug", it switches to debug mode automatically.
 
 <br/>
 
-## 🤖 File Format (Agent Mode)
+## 🖥️ Running Shell Commands
 
-When creating or modifying files, the AI uses this exact format:
+Prefix any terminal command with `!` to run it without leaving whyWhale:
+
+```bash
+!ls -la
+!git status
+!git commit -m "initial commit"
+!npm install express
+!python app.py
+!node server.js
+```
+
+The output is shown right in the chat. If a node script fails with a missing module error, whyWhale will **automatically install it and retry**.
+
+<br/>
+
+## 📂 Working with Files
+
+### Browse your project
 
 ```
-@@FILE: relative/path/filename.ext
-```language
-...complete file content...
+/ls              # list files in current folder
+/ls src/         # list a specific folder
+/tree            # show folder tree (3 levels deep)
+/tree 5          # tree with custom depth
 ```
-@@END
+
+### Read a file
+
 ```
+/read index.js
+/read src/app.py
+```
+
+Shows the file with **syntax highlighting** right in the terminal.
+
+### Create, delete, rename
+
+```
+/create server.js
+/delete old_file.js
+/rename old.js new.js
+```
+
+### Let AI write a file
+
+```
+/write server.js
+```
+
+whyWhale will ask what you want in the file, then the AI generates and saves it automatically.
+
+### Deep AI analysis
+
+```
+/analyse server.js
+```
+
+The AI reads the file and gives you: its purpose, quality score, issues found, and suggestions.
+
+### Scan your project into AI context
+
+```
+/scan
+```
+
+Reads all project files so the AI knows your full codebase when answering questions.
+
+<br/>
+
+## 🔬 Auto-Fix Mode
+
+```
+/debug -fix
+/debug -fix server.js
+```
+
+This is whyWhale's most powerful feature. It will:
+
+1. Scan your project
+2. Run the target file
+3. If it fails → read the error → ask the AI to fix it
+4. Repeat up to 4 times until it runs successfully
+
+> 💡 Missing npm packages are installed automatically before each attempt — no manual `npm install` needed.
+
+<br/>
+
+## 💾 Memory System
+
+whyWhale remembers facts between sessions. The AI saves things automatically, and you can manage them yourself:
+
+```
+/memory                        # see everything stored
+/memory set project myapp      # save a fact manually
+/memory clear                  # wipe all memory
+```
+
+You can also tell the AI to remember something mid-conversation:
+```
+remember that the backend runs on port 4000
+```
+The AI will save it with `@@MEMORY:` and it will be there next time you launch.
+
+<br/>
+
+## 🎯 Skills
+
+Skills are prompt packs that make the AI better at specific topics. Install one and it applies to every response.
+
+```
+/skill list                    # see all available skills
+/skill install react           # install the React skill
+/skill install docker          # install the Docker skill
+/skill show react              # preview what the skill does
+/skill remove react            # uninstall a skill
+```
+
+**Available skills:** `react` · `python` · `security` · `testing` · `api-design` · `docker` · `database` · `git` · `performance` · `typescript`
+
+<br/>
+
+## 💬 WhatsApp Integration
+
+Connect your WhatsApp number so the AI can receive and reply to messages.
+
+```
+/wp                            # start WhatsApp setup (scan QR)
+/wa status                     # check connection status
+/wa 919876543210 Hello!        # send a message manually
+/wa history                    # messages sent this session
+/wa owner 919876543210         # set which number the bot responds to
+/wa --reset                    # wipe session and scan a fresh QR
+```
+
+> ⚠️ Use a dedicated/spare number. Your phone must stay online, and WhatsApp Web can't be used at the same time.
+
+<br/>
+
+## 💾 Sessions
+
+Save and restore full conversations:
+
+```
+/save                          # save with auto-generated name
+/save my-project-chat          # save with a custom name
+/load                          # pick a saved session to restore
+/export                        # export chat as a styled HTML file
+```
+
+<br/>
+
+## 📊 Dashboard
+
+Open a live web dashboard in your browser:
+
+```
+/dashboard
+/dashboard 8080                # use a custom port (default is 7070)
+```
+
+Then open `http://localhost:7070` to see your session stats, memory, and chat history in a UI.
+
+<br/>
+
+## 🔧 Other Useful Commands
+
+```
+/stats                         # session overview (tokens, uptime, etc.)
+/tokens                        # quick token count
+/token                         # see token limit presets
+/token -set-usage 8192         # set max tokens for AI responses
+/model                         # see available models
+/model 2                       # switch to model #2 from the list
+/provider                      # switch AI provider
+/clear                         # clear the conversation (keep settings)
+/copy                          # copy last AI reply to clipboard
+/history                       # show past session summaries
+/run <command>                 # run a shell command (same as !)
+/exit                          # quit whyWhale
+```
+
+<br/>
+
+## 📁 Where whyWhale Stores Data
+
+All data is stored in your home folder:
+
+| Path | What's in it |
+|---|---|
+| `~/.whyWhale/config.json` | Your provider, model, and API key |
+| `~/.whyWhale/memory.json` | Saved facts and session summaries |
+| `~/.whyWhale/sessions/` | Saved conversations |
+| `~/.whyWhale/skills/` | Installed skill packs |
+| `~/.whyWhale/credentials/` | WhatsApp session (if connected) |
+
+<br/>
+
+## ⌨️ Quick Tips
+
+- **Multi-line input** — end a line with `\\` to continue on the next line
+- **Auto mode switch** — whyWhale detects intent and changes modes automatically
+- **Agent mode** — in `/mode agent`, the AI will create and edit files without asking confirmation each time
+- **`@@MEMORY:`** — if you see this in an AI response, it means the AI saved a fact for later
+- **Ctrl+C** — safely exits whyWhale
 
 <br/>
 
@@ -274,5 +320,5 @@ When creating or modifying files, the AI uses this exact format:
 </p>
 
 <p align="center">
-  <sub>MIT License — developed by <strong>CVKI ♞</strong></sub>
+  <sub>alpha 1 — MIT License — developed by <strong>CVKI ♞</strong></sub>
 </p>
