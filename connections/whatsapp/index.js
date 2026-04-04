@@ -1,5 +1,14 @@
 'use strict';
 
+// Suppress Baileys "Connection Closed" errors thrown during process exit
+// (the WA socket tears down mid-flight when Node exits — this is expected)
+process.on('unhandledRejection', (reason) => {
+  if (reason && reason.output && reason.output.statusCode === 428) return; // Connection Closed
+  if (reason && reason.message === 'Connection Closed') return;
+  // Re-throw anything that isn't a WA teardown error
+  console.error('Unhandled rejection:', reason);
+});
+
 const { dmGuard } = require('./dmPolicy');
 
 /**
@@ -222,7 +231,8 @@ async function startWhatsApp(opts = {}) {
   });
 
   _activeSock  = sock;
-  _startupSent = false;
+  // Do not reset _startupSent here — it may be a 440 auto-retry.
+  // _startupSent is only cleared on explicit logout/reset (see resetSession / wipeSession).
   _sentByBot.clear();
 
   // Suppress Baileys stderr noise
@@ -281,10 +291,13 @@ async function startWhatsApp(opts = {}) {
       const loggedOut = code === DisconnectReason.loggedOut;
 
       _activeSock  = null;
-      _startupSent = false;
+      // NOTE: _startupSent is intentionally NOT reset here so that
+      // auto-reconnects (e.g. code 440) do not re-send the startup DM.
+      // It is only reset on true logout / session wipe below.
 
       if (loggedOut) {
         wipeSession(); _retryCount = 0; _isRunning = false;
+        _startupSent = false;   // real logout → allow fresh startup message next time
         printDisconnectNotice('you logged out from your phone');
         if (typeof onDisconnected === 'function') onDisconnected('loggedOut');
         return;
@@ -306,6 +319,7 @@ async function startWhatsApp(opts = {}) {
       if (code === 401 || code === 403) {
         log.warn(`Auth error (code ${code}) — wiping session, will show fresh QR.`);
         wipeSession(); _retryCount = 0; _isRunning = false;
+        _startupSent = false;   // genuine fresh auth → allow startup message after QR scan
         await sleep(2000);
         startWhatsApp(opts);
         return;
@@ -475,4 +489,6 @@ async function sendToOwner(text) {
   } catch (_) {}
 }
 
-module.exports = { startWhatsApp, sendFarewellMessage, resetSession, sendToOwner };
+function getActiveSock() { return _activeSock; }
+
+module.exports = { startWhatsApp, sendFarewellMessage, resetSession, sendToOwner, getActiveSock };

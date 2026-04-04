@@ -33,11 +33,20 @@
 const path = require('path');
 const fs   = require('fs');
 const { loadConfig, loadMemory } = require('../../lib/config');
+const sessionCache = require('../../lib/session-cache');
 
 // ─── Shared context ───────────────────────────────────────────────────────────
 let _ctx = null;
 function setContext(ctx) { _ctx = ctx; }
 
+
+function stripCodeFences(code) {
+  return code
+    .replace(/^```[\w.-]*[\t ]*\r?\n/, '')
+    .replace(/\r?\n```[\w.-]*[\t ]*$/, '')
+    .replace(/^```[\w.-]*[\t ]*\r?\n/, '')
+    .replace(/\r?\n```[\w.-]*[\t ]*$/, '');
+}
 // ─── Per-sender rolling history ───────────────────────────────────────────────
 const histories   = new Map();
 const MAX_HISTORY = 20;
@@ -52,12 +61,34 @@ function pushHistory(sender, role, content) {
   if (h.length > MAX_HISTORY) h.splice(0, h.length - MAX_HISTORY);
 }
 
+// ─── Robust code-fence stripper ─────────────────────────────────────────────────────────────
+function stripCodeFences(raw) {
+  if (!raw) return raw;
+  let s = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const trimmed = s.trimStart();
+  if (!trimmed.startsWith('```')) return s;
+  s = trimmed;
+  const openMatch = s.match(/^```([^\n]*)\n/);
+  if (!openMatch) return s;
+  const extraOnFenceLine = openMatch[1].replace(/^[\w.+\-#/ ]*/, '').trim();
+  s = s.slice(openMatch[0].length);
+  if (extraOnFenceLine) s = extraOnFenceLine + '\n' + s;
+  const lastFenceIdx = s.lastIndexOf('\n```');
+  if (lastFenceIdx !== -1) {
+    const before = s.slice(0, lastFenceIdx);
+    const after  = s.slice(lastFenceIdx + 4).replace(/^[^\S\n]*\n/, '');
+    s = before + (after.trim() ? '\n' + after : '');
+  }
+  return s;
+}
+
 // ─── Directive parser ─────────────────────────────────────────────────────────
 function parseDirectives(text) {
-  const result = { files: [], runs: [], memory: [] };
+  const result = { files: [], runs: [], memory: [], sends: [] };
   const fileRe  = /@@FILE:([^\n]+)\n([\s\S]*?)@@END/g;
   const runRe   = /@@RUN:([^\n]+)/g;
   const memRe   = /@@MEMORY:([^=\n]+)=([^\n]+)/g;
+  const sendRe  = /@@SEND:\s*([^\n]+)/g;
   let m;
   while ((m = fileRe.exec(text)) !== null)
     result.files.push({ path: m[1].trim(), content: m[2] });
@@ -65,22 +96,73 @@ function parseDirectives(text) {
     result.runs.push(m[1].trim());
   while ((m = memRe.exec(text)) !== null)
     result.memory.push({ key: m[1].trim(), value: m[2].trim() });
+  while ((m = sendRe.exec(text)) !== null)
+    result.sends.push(m[1].trim());
   return result;
 }
 
 function hasWork(directives) {
   return directives.files.length > 0 ||
          directives.runs.length  > 0 ||
-         directives.memory.length > 0;
+         directives.memory.length > 0 ||
+         directives.sends.length > 0;
 }
 
 function detectWorkType(directives, rawReply) {
-  const hasSend = /@@SEND:/i.test(rawReply) ||
+  const hasSend = directives.sends.length > 0 ||
+    /@@SEND:/i.test(rawReply) ||
     /\bsend\b.*\b(file|zip|attachment)\b/i.test(rawReply) ||
     /\b(zip|compress|archive)\b/i.test(rawReply);
   if (hasSend)                              return 'send';
   if (hasWork(directives))                  return 'work';
   return 'chat';
+}
+
+// ─── Send File Command ────────────────────────────────────────────────────────────
+// Detects 'send/give/share me the file' requests before hitting the AI.
+// Returns an array of absolute paths to send, or null if not a send request.
+function detectSendFileRequest(text) {
+  const lower = text.toLowerCase().trim();
+
+  // /send <filename> explicit command
+  if (lower.startsWith('/send ')) {
+    const name = text.slice(6).trim();
+    return resolveFileNames([name]);
+  }
+
+  // Match 'send/give/share me filename.ext'
+  const explicitFile = /\b(?:send|give|share|forward|get|attach|transfer)\b[^\n]{0,30}\b([\w.-]+\.(?:html?|css|js|ts|jsx|tsx|py|json|txt|md|pdf|zip|png|jpg|jpeg|svg|mp4|mp3|xlsx|csv|doc|docx))\b/i.exec(text);
+  if (explicitFile) return resolveFileNames([explicitFile[1]]);
+
+  // Generic 'give me the file / send me the file / send the html'
+  const generic = /\b(?:send|give|share|forward|get)\b.{0,40}\b(?:the\s+)?(?:file|html|css|code|script|zip|pdf|document|attachment)\b/i.test(lower);
+  if (generic) {
+    // Send the most recently modified file in cwd
+    try {
+      const cwd = process.cwd();
+      const files = fs.readdirSync(cwd)
+        .map(f => { const abs = path.join(cwd, f); try { return { abs, mtime: fs.statSync(abs).mtimeMs, isFile: fs.statSync(abs).isFile() }; } catch(_) { return null; } })
+        .filter(e => e && e.isFile)
+        .sort((a, b) => b.mtime - a.mtime);
+      if (files.length) return [files[0].abs];
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+function resolveFileNames(names) {
+  const results = [];
+  for (const name of names) {
+    const candidates = [
+      path.isAbsolute(name) ? name : path.join(process.cwd(), name),
+      path.join(require('os').homedir(), name),
+    ];
+    for (const c of candidates) {
+      try { if (fs.existsSync(c) && fs.statSync(c).isFile()) { results.push(c); break; } } catch(_) {}
+    }
+  }
+  return results.length > 0 ? results : null;
 }
 
 // ─── WA Command dispatcher ────────────────────────────────────────────────────
@@ -477,9 +559,22 @@ async function getAIResponse(userMessage, sender = 'unknown') {
   if (cmdReply !== null) {
     return {
       reply:      cmdReply,
-      directives: { files: [], runs: [], memory: [] },
+      directives: { files: [], runs: [], memory: [], sends: [] },
       workType:   'chat',
       rawReply:   cmdReply,
+    };
+  }
+
+  // Short-circuit: 'send/give me the file' before calling the AI
+  const filesToSend = detectSendFileRequest(userMessage);
+  if (filesToSend) {
+    const names = filesToSend.map(p => require('path').basename(p)).join(', ');
+    const sendReply = '📤 Sending you: ' + names;
+    return {
+      reply:      sendReply,
+      directives: { files: [], runs: [], memory: [], sends: filesToSend },
+      workType:   'send',
+      rawReply:   sendReply,
     };
   }
 
@@ -499,6 +594,7 @@ async function getAIResponse(userMessage, sender = 'unknown') {
     .replace(/@@FILE:[^\n]+\n[\s\S]*?@@END/g, '')
     .replace(/@@RUN:[^\n]+/g, '')
     .replace(/@@MEMORY:[^\n]+/g, '')
+    .replace(/@@SEND:[^\n]+/g, '')
     .trim();
 
   // Annotate reply with what's about to happen
@@ -555,14 +651,16 @@ async function executeWork(directives, sender) {
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       // Strip markdown code fences if model wrapped content
       let fc = f.content;
-      fc = fc.replace(/^```[\w]*\r?\n/, '').replace(/\r?\n```[\s]*$/, '');
+      fc = stripCodeFences(fc);
       fs.writeFileSync(abs, fc, 'utf8');
       wline('📄', 'wrote', f.path, true);
       summary.push('📄 wrote `' + f.path + '`');
       createdFiles.push(abs);
+      try { const _c = sessionCache.loadCache(); sessionCache.recordFile(_c, abs, fc, 'created'); } catch(_) {}
     } catch (e) {
       wline('✘', 'failed', f.path + ' — ' + e.message, false);
       summary.push('✘ failed `' + f.path + '`: ' + e.message);
+      try { const _c2 = sessionCache.loadCache(); sessionCache.recordFile(_c2, f.path, e.message, 'error'); } catch(_) {}
     }
   }
 
@@ -584,11 +682,13 @@ async function executeWork(directives, sender) {
         );
       }
       summary.push('⚡ ran `' + cmd + '`');
+      try { const _cc = sessionCache.loadCache(); sessionCache.recordCommand(_cc, cmd, 0, ''); } catch(_) {}
     } catch (e) {
       const errOut = (e.stderr || e.message || '').trim().split('\n')[0];
       if (errOut) wline('✘', 'error', errOut, false);
       process.stdout.write(C.waGreen+'┟    '+R+C.red+'exit '+((e.status||1))+R+'\n');
       summary.push('✘ `' + cmd + '` failed (exit ' + (e.status||1) + ')');
+      try { const _cc2 = sessionCache.loadCache(); sessionCache.recordCommand(_cc2, cmd, e.status||1, errOut); } catch(_) {}
     }
   }
 
@@ -607,6 +707,29 @@ async function executeWork(directives, sender) {
   }
 
   // ── Close section box ──────────────────────────────────────────────────────
+
+  // ── Resolve & queue @@SEND: files (existing files on disk) ────
+  if (directives.sends && directives.sends.length > 0) {
+    for (const rawPath of directives.sends) {
+      const candidates = [
+        path.isAbsolute(rawPath) ? rawPath : path.join(process.cwd(), rawPath),
+        path.join(require('os').homedir(), rawPath),
+      ];
+      let found = null;
+      for (const c of candidates) {
+        if (fs.existsSync(c) && fs.statSync(c).isFile()) { found = c; break; }
+      }
+      if (found) {
+        wline('\xf0\x9f\x93\xa4', 'send  ', path.basename(found), true);
+        summary.push('\xf0\x9f\x93\xa4 queued for sending: `' + path.basename(found) + '`');
+        createdFiles.push(found);
+      } else {
+        wline('\xe2\x9c\x98', 'send  ', rawPath + ' \xe2\x80\x94 file not found', false);
+        summary.push('\xe2\x9c\x98 could not find `' + rawPath + '`');
+      }
+    }
+  }
+
   const ok = summary.every(s => !s.startsWith('✘'));
   process.stdout.write([
     C.waGreen+'└'+R,
@@ -689,20 +812,52 @@ async function integratedCall(userMessage, sender) {
   return raw || '(no response)';
 }
 
+// ─── WA Request Amplifier ─────────────────────────────────────────────────────────────────────────────
+function amplifyWARequest(text) {
+  const lower = text.toLowerCase();
+  const isBuild = /\b(create|build|make|generate|write|design)\b/.test(lower) &&
+                  /\b(html|css|page|website|site|app|component|ui|landing|portfolio|dashboard|template)\b/.test(lower);
+  const isEdit  = /\b(improve|update|better|nicer|modern|beautiful|apple|redesign|color|colour|style|enhance)\b/.test(lower) &&
+                  /\b(html|css|page|website|design|look|ui|the code|the file)\b/.test(lower);
+  if (!isBuild && !isEdit) return text;
+
+  const appleStyle = /apple|minimal|clean|cupertino/.test(lower);
+  const palette = appleStyle
+    ? 'Apple-style palette: white/off-white backgrounds, system fonts, black text, subtle blue accents (#0071e3), generous whitespace.'
+    : 'Modern gradient palette: dark hero (deep navy to indigo), vivid accent, frosted glass cards, white text.';
+
+  return `${text}
+
+[MANDATORY SPEC] Write a COMPLETE, production-grade HTML file (@@FILE: index.html).
+Minimum 700 lines. Do NOT truncate. Include:
+- Sticky navbar with blur + mobile hamburger menu
+- Full-height hero: ${palette} CSS keyframe animations.
+- Feature cards grid (3-6 cards) with hover lift effects
+- Stats/testimonials section with scroll animations
+- Contact/CTA section + multi-column footer
+- CSS variables in :root, responsive breakpoints (768px, 480px)
+- Intersection Observer JS for scroll-reveal animations
+- Smooth scroll, countup numbers, all transitions 0.3-0.5s
+Write every line. No placeholders.`;
+}
+
 // ─── Standalone call ──────────────────────────────────────────────────────────
 async function standaloneCall(userMessage, sender) {
   const cfg = loadConfig();
   const mem = loadMemory();
 
-  const provider = process.env.WA_PROVIDER || cfg.provider || 'anthropic';
-  const model    = process.env.WA_MODEL    || cfg.model    || 'claude-sonnet-4-20250514';
-  const apiKey   = process.env.WA_API_KEY  || cfg.apiKey   || '';
+  const provider  = process.env.WA_PROVIDER || cfg.provider || 'anthropic';
+  const model     = process.env.WA_MODEL    || cfg.model    || 'claude-sonnet-4-20250514';
+  const apiKey    = process.env.WA_API_KEY  || cfg.apiKey   || '';
+  const maxTokens = cfg.maxTokens || 8192;
 
   if (!apiKey && provider !== 'ollama') {
     return '⚠️ No API key configured. Run `whywhale --setup` or set WA_API_KEY.';
   }
 
-  pushHistory(sender, 'user', userMessage);
+  // Amplify brief build/create requests for richer output
+  const amplified = amplifyWARequest(userMessage);
+  pushHistory(sender, 'user', amplified);
   const systemPrompt = buildSystemPrompt(mem);
   const messages     = getHistory(sender);
 
@@ -712,10 +867,10 @@ async function standaloneCall(userMessage, sender) {
     try {
       if (attempt > 1) await new Promise(r => setTimeout(r, 2000));
       switch (provider) {
-        case 'anthropic':   raw = await callAnthropic({ apiKey, model, systemPrompt, messages }); break;
-        case 'openrouter':  raw = await callOpenRouter({ apiKey, model, systemPrompt, messages }); break;
-        case 'groq':        raw = await callGroq({ apiKey, model, systemPrompt, messages }); break;
-        case 'ollama':      raw = await callOllama({ model, systemPrompt, messages }); break;
+        case 'anthropic':   raw = await callAnthropic({ apiKey, model, systemPrompt, messages, maxTokens }); break;
+        case 'openrouter':  raw = await callOpenRouter({ apiKey, model, systemPrompt, messages, maxTokens }); break;
+        case 'groq':        raw = await callGroq({ apiKey, model, systemPrompt, messages, maxTokens }); break;
+        case 'ollama':      raw = await callOllama({ model, systemPrompt, messages, maxTokens }); break;
         default:            raw = `⚠️ Unknown provider: ${provider}`;
       }
       break; // success — exit retry loop
@@ -729,16 +884,16 @@ async function standaloneCall(userMessage, sender) {
 }
 
 // ─── Provider implementations ─────────────────────────────────────────────────
-async function callAnthropic({ apiKey, model, systemPrompt, messages }) {
+async function callAnthropic({ apiKey, model, systemPrompt, messages, maxTokens = 8192 }) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model, max_tokens: 4096, system: systemPrompt, messages }),
+    body: JSON.stringify({ model, max_tokens: maxTokens, system: systemPrompt, messages }),
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text()}`);
   return (await res.json()).content?.[0]?.text || '';
 }
-async function callOpenRouter({ apiKey, model, systemPrompt, messages }) {
+async function callOpenRouter({ apiKey, model, systemPrompt, messages, maxTokens = 8192 }) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -747,7 +902,7 @@ async function callOpenRouter({ apiKey, model, systemPrompt, messages }) {
   if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${await res.text()}`);
   return (await res.json()).choices?.[0]?.message?.content || '';
 }
-async function callGroq({ apiKey, model, systemPrompt, messages }) {
+async function callGroq({ apiKey, model, systemPrompt, messages, maxTokens = 8192 }) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -756,7 +911,7 @@ async function callGroq({ apiKey, model, systemPrompt, messages }) {
   if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
   return (await res.json()).choices?.[0]?.message?.content || '';
 }
-async function callOllama({ model, systemPrompt, messages }) {
+async function callOllama({ model, systemPrompt, messages, maxTokens = 8192 }) {
   const base = process.env.OLLAMA_HOST || 'http://localhost:11434';
   const res  = await fetch(`${base}/api/chat`, {
     method: 'POST',
@@ -790,7 +945,16 @@ function buildSystemPrompt(mem) {
     '  @@END',
     '  @@RUN:<shell command>',
     '  @@MEMORY:<key>=<value>',
+    '  @@SEND:<relative/path/to/existing/file>  ← use this to send an already-existing file to the user',
+    '',
+    'FILE QUALITY RULES (mandatory):',
+    '  \u2022 HTML/CSS/web files: minimum 600 lines. Include CSS variables, animations, responsive layout,',
+    '    gradient backgrounds, hover effects, sticky navbar, hero section, feature cards, footer.',
+    '    Use modern color palettes \u2014 never plain #333 backgrounds. Always embed JS for interactivity.',
+    '  \u2022 Any code file: write COMPLETE implementation \u2014 no placeholders, no TODO comments, no truncation.',
+    '  \u2022 Backend/API: full error handling, input validation, proper HTTP status codes.',
     memLines ? `\nWhat I remember about you:\n${memLines}` : '',
+    (() => { try { const sc = sessionCache.loadCache(); const ctx = sessionCache.buildSessionContext(sc); return ctx ? '\n' + ctx : ''; } catch(_) { return ''; } })(),
   ].filter(Boolean).join('\n');
 }
 
